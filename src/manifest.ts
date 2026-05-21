@@ -1,6 +1,8 @@
 import { readFile } from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
-import { parse as parseYaml } from "yaml";
+import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
+import { writeFileAtomic } from "./atomic.js";
+import { isNotFound, isPlainObject } from "./util.js";
 
 /**
  * A named remote git repository. Skills reference a remote by its key in the
@@ -42,15 +44,8 @@ export class ManifestValidationError extends Error {
   }
 }
 
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    !Array.isArray(value)
-  );
-}
-
-function emptyManifest(): Manifest {
+/** A fresh, empty manifest. */
+export function emptyManifest(): Manifest {
   return { remotes: {}, skills: [] };
 }
 
@@ -199,7 +194,7 @@ export function expandDest(
  * strips a trailing `.git`, strips a trailing slash, and rewrites SSH
  * `git@host:user/repo` into a comparable `host/user/repo` form.
  */
-function normalizeRepoUrl(url: string): string {
+export function normalizeRepoUrl(url: string): string {
   let s = url.trim();
 
   // SSH shorthand: git@github.com:user/repo(.git) -> host/user/repo.
@@ -238,18 +233,21 @@ export function slugFromRepo(url: string): string {
  *   - `remote` overrides the chosen name when creating.
  *   - a slug collision (different repo, same desired name) gets a numeric suffix.
  *   - `ref` is recorded on a newly created remote.
+ *
+ * Returns the new remotes map, the resolved name, and the chosen remote's `ref`
+ * (so callers need not index back into the map).
  */
 export function findOrCreateRemote(
   remotes: Record<string, Remote>,
   options: { repo: string; remote?: string; ref?: string },
-): { remotes: Record<string, Remote>; name: string } {
+): { remotes: Record<string, Remote>; name: string; ref?: string } {
   const { repo, remote, ref } = options;
   const targetNormalized = normalizeRepoUrl(repo);
 
   // Reuse an existing remote with a matching normalized repo URL.
   for (const [name, value] of Object.entries(remotes)) {
     if (normalizeRepoUrl(value.repo) === targetNormalized) {
-      return { remotes: { ...remotes }, name };
+      return { remotes: { ...remotes }, name, ref: value.ref };
     }
   }
 
@@ -267,7 +265,7 @@ export function findOrCreateRemote(
     created.ref = ref;
   }
 
-  return { remotes: { ...remotes, [name]: created }, name };
+  return { remotes: { ...remotes, [name]: created }, name, ref: created.ref };
 }
 
 /**
@@ -286,15 +284,6 @@ export async function loadManifestFile(path: string): Promise<Manifest | null> {
     throw err;
   }
   return parseManifest(text);
-}
-
-function isNotFound(err: unknown): boolean {
-  return (
-    typeof err === "object" &&
-    err !== null &&
-    "code" in err &&
-    (err as { code?: unknown }).code === "ENOENT"
-  );
 }
 
 /**
@@ -319,4 +308,49 @@ export async function resolveManifests(options: {
  */
 export function manifestBaseDir(manifestPath: string): string {
   return dirname(manifestPath);
+}
+
+/**
+ * Add or replace a skill in a manifest, matching by `name`. Pure: returns a new
+ * Manifest; the input is not mutated. Replaced skills keep their position.
+ */
+export function upsertSkill(manifest: Manifest, skill: SkillEntry): Manifest {
+  const idx = manifest.skills.findIndex((s) => s.name === skill.name);
+  const skills =
+    idx === -1
+      ? [...manifest.skills, skill]
+      : manifest.skills.map((s, i) => (i === idx ? skill : s));
+  return { remotes: { ...manifest.remotes }, skills };
+}
+
+/**
+ * Serialize a manifest to YAML deterministically: remotes keyed in sorted order
+ * with `repo` before `ref`, skills in their list order with a fixed field order.
+ * Note: this normalizes formatting and drops any comments a user may have added
+ * to a hand-edited manifest.
+ */
+export function serializeManifest(manifest: Manifest): string {
+  const remotes: Record<string, Remote> = {};
+  for (const name of Object.keys(manifest.remotes).sort()) {
+    const r = manifest.remotes[name];
+    remotes[name] = r.ref !== undefined ? { repo: r.repo, ref: r.ref } : { repo: r.repo };
+  }
+  const doc = {
+    remotes,
+    skills: manifest.skills.map((s) => ({
+      name: s.name,
+      remote: s.remote,
+      src: s.src,
+      dest: s.dest,
+    })),
+  };
+  return stringifyYaml(doc);
+}
+
+/**
+ * Write a manifest to `path` atomically, creating the parent directory if
+ * needed.
+ */
+export async function saveManifestFile(path: string, manifest: Manifest): Promise<void> {
+  await writeFileAtomic(path, serializeManifest(manifest));
 }

@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll } from "vitest";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { statSync } from "node:fs";
-import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,6 +11,33 @@ const run = promisify(execFile);
 
 const repoRoot = resolve(fileURLToPath(new URL(".", import.meta.url)), "..");
 const cliPath = join(repoRoot, "dist", "cli.js");
+
+// Git env isolated from the developer's global/system config for deterministic
+// fixture repos (default branch name, identity, hooks).
+const GIT_ENV = {
+  ...process.env,
+  GIT_CONFIG_GLOBAL: "/dev/null",
+  GIT_CONFIG_SYSTEM: "/dev/null",
+  GIT_AUTHOR_NAME: "Test",
+  GIT_AUTHOR_EMAIL: "test@example.com",
+  GIT_COMMITTER_NAME: "Test",
+  GIT_COMMITTER_EMAIL: "test@example.com",
+};
+
+/**
+ * Create a small fixture git repo with a `skills/demo` subtree and return a
+ * `file://` URL for it.
+ */
+async function createFixtureRepo(): Promise<{ dir: string; url: string }> {
+  const dir = await mkdtemp(join(tmpdir(), "skync-fixture-"));
+  await mkdir(join(dir, "skills", "demo"), { recursive: true });
+  await writeFile(join(dir, "README.md"), "root\n");
+  await writeFile(join(dir, "skills", "demo", "SKILL.md"), "demo v1\n");
+  await run("git", ["init", "-q", "-b", "main"], { cwd: dir, env: GIT_ENV });
+  await run("git", ["add", "-A"], { cwd: dir, env: GIT_ENV });
+  await run("git", ["commit", "-q", "-m", "init"], { cwd: dir, env: GIT_ENV });
+  return { dir, url: `file://${dir}` };
+}
 
 interface RunResult {
   code: number;
@@ -92,6 +119,100 @@ describe("skync list (CLI)", () => {
       // Not a stack trace.
       expect(res.stderr).not.toMatch(/at .*\(.*:\d+:\d+\)/);
     } finally {
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("skync add (CLI)", () => {
+  it("vendors a fresh project skill: dest, base, manifest, and state", async () => {
+    const fixture = await createFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-add-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const res = await runCli(
+        ["add", "demo", "--repo", fixture.url, "--src", "skills/demo", "--dest", "vendor/demo"],
+        work,
+        home,
+      );
+      expect(res.code).toBe(0);
+
+      // dest received only the subtree contents.
+      expect(await readFile(join(work, "vendor/demo/SKILL.md"), "utf8")).toBe("demo v1\n");
+      // base mirrors the synced upstream.
+      expect(await readFile(join(work, ".skync/base/demo/SKILL.md"), "utf8")).toBe("demo v1\n");
+
+      // manifest gained the skill and an auto-named remote.
+      const manifest = await readFile(join(work, "skync.yaml"), "utf8");
+      expect(manifest).toContain("name: demo");
+      expect(manifest).toContain("src: skills/demo");
+
+      // state.json recorded a concrete 40-char SHA.
+      const state = JSON.parse(await readFile(join(work, ".skync/state.json"), "utf8"));
+      expect(state.skills.demo.sha).toMatch(/^[0-9a-f]{40}$/);
+      expect(state.skills.demo.src).toBe("skills/demo");
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("vendors a fresh global skill under the global state dir", async () => {
+    const fixture = await createFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-add-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const res = await runCli(
+        [
+          "add",
+          "demo",
+          "--global",
+          "--repo",
+          fixture.url,
+          "--src",
+          "skills/demo",
+          "--dest",
+          "~/.claude/skills/demo",
+        ],
+        work,
+        home,
+      );
+      expect(res.code).toBe(0);
+      expect(await readFile(join(home, ".claude/skills/demo/SKILL.md"), "utf8")).toBe("demo v1\n");
+      const manifest = await readFile(join(home, ".config/skync/manifest.yaml"), "utf8");
+      expect(manifest).toContain("name: demo");
+      const state = JSON.parse(
+        await readFile(join(home, ".config/skync/.skync/state.json"), "utf8"),
+      );
+      expect(state.skills.demo.sha).toMatch(/^[0-9a-f]{40}$/);
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("errors and exits 1 when dest already exists and is not empty", async () => {
+    const fixture = await createFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-add-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      await mkdir(join(work, "vendor/demo"), { recursive: true });
+      await writeFile(join(work, "vendor/demo/local.md"), "mine\n");
+
+      const res = await runCli(
+        ["add", "demo", "--repo", fixture.url, "--src", "skills/demo", "--dest", "vendor/demo"],
+        work,
+        home,
+      );
+      expect(res.code).toBe(1);
+      expect(res.stderr).toMatch(/already exists/);
+      expect(res.stderr).toMatch(/not yet supported/);
+      expect(res.stderr).not.toMatch(/at .*\(.*:\d+:\d+\)/);
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
       await rm(work, { recursive: true, force: true });
       await rm(home, { recursive: true, force: true });
     }
