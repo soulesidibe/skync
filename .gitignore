@@ -17,5 +17,8 @@ npm-debug.log*
 # Claude Code worktrees (created per-issue, not tracked)
 .claude/worktree/
 
+# Claude Code agent-local memory (not tracked)
+.claude/agent-memory/
+
 # OS
 .DS_Store
