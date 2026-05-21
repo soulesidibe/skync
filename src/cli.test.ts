@@ -2,9 +2,9 @@ import { describe, it, expect, beforeAll } from "vitest";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { statSync } from "node:fs";
-import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const run = promisify(execFile);
@@ -211,6 +211,96 @@ describe("skync add (CLI)", () => {
       expect(res.stderr).toMatch(/already exists/);
       expect(res.stderr).toMatch(/not yet supported/);
       expect(res.stderr).not.toMatch(/at .*\(.*:\d+:\d+\)/);
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+});
+
+async function commitToFixture(dir: string, files: Record<string, string>, message: string): Promise<void> {
+  for (const [rel, contents] of Object.entries(files)) {
+    await mkdir(dirname(join(dir, rel)), { recursive: true });
+    await writeFile(join(dir, rel), contents);
+  }
+  await run("git", ["add", "-A"], { cwd: dir, env: GIT_ENV });
+  await run("git", ["commit", "-q", "-m", message], { cwd: dir, env: GIT_ENV });
+}
+
+async function demoStateSha(work: string): Promise<string> {
+  const state = JSON.parse(await readFile(join(work, ".skync/state.json"), "utf8"));
+  return state.skills.demo.sha as string;
+}
+
+describe("skync update (CLI)", () => {
+  it("applies a non-overlapping upstream change and preserves a local edit", async () => {
+    const fixture = await createFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-update-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const add = await runCli(
+        ["add", "demo", "--repo", fixture.url, "--src", "skills/demo", "--dest", "vendor/demo"],
+        work,
+        home,
+      );
+      expect(add.code).toBe(0);
+      const before = await demoStateSha(work);
+
+      // Local edit to a file upstream does not touch.
+      await writeFile(join(work, "vendor/demo/SKILL.md"), "demo v1 local edit\n");
+      // Upstream adds a new file (non-overlapping).
+      await commitToFixture(fixture.dir, { "skills/demo/EXTRA.md": "extra\n" }, "add extra");
+
+      const res = await runCli(["update", "demo"], work, home);
+      expect(res.code).toBe(0);
+
+      // Upstream addition landed; local edit preserved.
+      expect(await readFile(join(work, "vendor/demo/EXTRA.md"), "utf8")).toBe("extra\n");
+      expect(await readFile(join(work, "vendor/demo/SKILL.md"), "utf8")).toBe("demo v1 local edit\n");
+
+      // Base advanced to upstream (now carries EXTRA.md) and state SHA changed.
+      expect(await readFile(join(work, ".skync/base/demo/EXTRA.md"), "utf8")).toBe("extra\n");
+      const after = await demoStateSha(work);
+      expect(after).not.toBe(before);
+      expect(after).toMatch(/^[0-9a-f]{40}$/);
+
+      // A pre-merge snapshot exists under backups/.
+      const snaps = await readdir(join(work, ".skync/backups/demo"));
+      expect(snaps.length).toBe(1);
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a conflicting update, exits 1, and leaves dest and base untouched", async () => {
+    const fixture = await createFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-update-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const add = await runCli(
+        ["add", "demo", "--repo", fixture.url, "--src", "skills/demo", "--dest", "vendor/demo"],
+        work,
+        home,
+      );
+      expect(add.code).toBe(0);
+      const before = await demoStateSha(work);
+
+      // Both sides change the same line differently => overlapping conflict.
+      await writeFile(join(work, "vendor/demo/SKILL.md"), "demo local\n");
+      await commitToFixture(fixture.dir, { "skills/demo/SKILL.md": "demo upstream\n" }, "edit skill");
+
+      const res = await runCli(["update", "demo"], work, home);
+      expect(res.code).toBe(1);
+      expect(res.stderr).toMatch(/conflict/i);
+      expect(res.stderr).not.toMatch(/at .*\(.*:\d+:\d+\)/);
+
+      // dest still holds the local edit; base and state SHA unchanged.
+      expect(await readFile(join(work, "vendor/demo/SKILL.md"), "utf8")).toBe("demo local\n");
+      expect(await readFile(join(work, ".skync/base/demo/SKILL.md"), "utf8")).toBe("demo v1\n");
+      expect(await demoStateSha(work)).toBe(before);
     } finally {
       await rm(fixture.dir, { recursive: true, force: true });
       await rm(work, { recursive: true, force: true });

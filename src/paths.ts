@@ -59,3 +59,19 @@ export function baseSkillDir(stateDir: string, skillName: string): string {
 export function statePath(stateDir: string): string {
   return join(stateDir, "state.json");
 }
+
+/**
+ * Directory holding all timestamped backup snapshots for a skill within a
+ * state dir.
+ */
+export function backupsDir(stateDir: string, skillName: string): string {
+  return join(stateDir, "backups", skillName);
+}
+
+/**
+ * Path to a single timestamped backup snapshot for a skill. `timestamp` must be
+ * filesystem-safe (e.g. an ISO string with `:` stripped, or epoch millis).
+ */
+export function backupSnapshotDir(stateDir: string, skillName: string, timestamp: string): string {
+  return join(backupsDir(stateDir, skillName), timestamp);
+}

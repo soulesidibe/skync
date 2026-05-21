@@ -1,6 +1,5 @@
-import { cp, mkdir, readFile, rename, rm } from "node:fs/promises";
-import { dirname } from "node:path";
-import { writeFileAtomic } from "./atomic.js";
+import { readFile } from "node:fs/promises";
+import { writeFileAtomic, copyDirAtomic } from "./atomic.js";
 import { isNotFound, isPlainObject } from "./util.js";
 
 /** Current on-disk state schema version, for forward migration. */
@@ -120,10 +119,22 @@ export async function writeState(path: string, state: SkyncState): Promise<void>
  * last so a crash never leaves state pointing at an incomplete base.
  */
 export async function populateBase(baseSkillDir: string, srcDir: string): Promise<void> {
-  await mkdir(dirname(baseSkillDir), { recursive: true });
-  const tmp = `${baseSkillDir}.tmp-${process.pid}-${Date.now()}`;
-  await rm(tmp, { recursive: true, force: true });
-  await cp(srcDir, tmp, { recursive: true });
-  await rm(baseSkillDir, { recursive: true, force: true });
-  await rename(tmp, baseSkillDir);
+  await copyDirAtomic(baseSkillDir, srcDir);
+}
+
+/**
+ * Snapshot a skill's live `dest` tree into a backup directory before a merge,
+ * so any update is reversible. A filesystem copy (not a parsed tree) preserves
+ * file modes and symlinks; the copy is staged in a temp sibling then renamed in.
+ */
+export async function snapshotLocal(snapshotDir: string, destDir: string): Promise<void> {
+  await copyDirAtomic(snapshotDir, destDir);
+}
+
+/**
+ * Restore a skill's `dest` tree from a previously taken snapshot, replacing the
+ * current contents atomically.
+ */
+export async function restoreSnapshot(destDir: string, snapshotDir: string): Promise<void> {
+  await copyDirAtomic(destDir, snapshotDir);
 }

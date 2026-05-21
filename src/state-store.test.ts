@@ -2,10 +2,13 @@ import { describe, it, expect } from "vitest";
 import { mkdtemp, mkdir, rm, writeFile, readFile, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { stat } from "node:fs/promises";
 import {
   readState,
   writeState,
   populateBase,
+  snapshotLocal,
+  restoreSnapshot,
   emptyState,
   STATE_VERSION,
   StateValidationError,
@@ -97,6 +100,37 @@ describe("state store", () => {
 
       const entries = await readdir(base);
       expect(entries).toEqual(["new.txt"]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("snapshots and restores a dest tree round-trip, preserving the executable bit", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "skync-snap-"));
+    try {
+      const dest = join(dir, "dest");
+      await mkdir(dest, { recursive: true });
+      await writeFile(join(dest, "doc.md"), "hello\n");
+      await writeFile(join(dest, "run.sh"), "#!/bin/sh\necho hi\n", { mode: 0o755 });
+
+      const snapshot = join(dir, "backups", "demo", "20260521T000000000Z");
+      await snapshotLocal(snapshot, dest);
+
+      // Snapshot mirrors the dest, executable bit included.
+      expect(await readFile(join(snapshot, "doc.md"), "utf8")).toBe("hello\n");
+      expect((await stat(join(snapshot, "run.sh"))).mode & 0o111).not.toBe(0);
+
+      // Mutate the live dest, then restore from the snapshot.
+      await rm(join(dest, "doc.md"));
+      await writeFile(join(dest, "doc.md"), "corrupted\n");
+      await restoreSnapshot(dest, snapshot);
+
+      expect(await readFile(join(dest, "doc.md"), "utf8")).toBe("hello\n");
+      expect((await stat(join(dest, "run.sh"))).mode & 0o111).not.toBe(0);
+
+      // No temp swap dirs left behind in either parent.
+      expect((await readdir(dir)).sort()).toEqual(["backups", "dest"]);
+      expect(await readdir(join(dir, "backups", "demo"))).toEqual(["20260521T000000000Z"]);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

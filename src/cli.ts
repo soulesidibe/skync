@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-import { homedir } from "node:os";
-import { isAbsolute } from "node:path";
-import { readdir, stat } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
+import { isAbsolute, join } from "node:path";
+import { readdir, stat, mkdtemp, rm } from "node:fs/promises";
 import { Command } from "commander";
 import pc from "picocolors";
 import {
@@ -25,10 +25,21 @@ import {
   globalStateDir,
   cacheDir,
   baseSkillDir,
+  backupSnapshotDir,
   statePath,
 } from "./paths.js";
 import { ensureRemoteClone, resolveRef, materializeSrc } from "./remote-cache.js";
-import { readState, writeState, populateBase } from "./state-store.js";
+import { readState, writeState, populateBase, snapshotLocal } from "./state-store.js";
+import {
+  swapDirAtomic,
+  recoverPendingSwap,
+  stagingPathFor,
+} from "./atomic.js";
+import { readTree, writeTree } from "./tree-io.js";
+import { mergeTrees } from "./treemerge.js";
+
+/** Thrown when an update cannot auto-merge; conflict resolution arrives later. */
+class MergeConflictError extends Error {}
 
 /**
  * A skill plus the directory of the manifest that declared it, so we can
@@ -198,6 +209,178 @@ async function runAdd(name: string, options: AddOptions): Promise<void> {
   process.stdout.write(`  ${options.src} ${pc.dim("→")} ${dest}\n`);
 }
 
+interface UpdateOptions {
+  ref?: string;
+  global?: boolean;
+}
+
+interface UpdateTarget {
+  skill: SkillEntry;
+  baseDir: string;
+  stateDir: string;
+}
+
+/**
+ * Resolve which skills `update` operates on and the remote table to look repos
+ * up in. Each target carries the state dir of the manifest that declared it, so
+ * project and global skills read and write their own base trees and state.
+ */
+function resolveUpdateTargets(
+  project: Manifest | null,
+  projectBaseDir: string,
+  projStateDir: string,
+  global: Manifest | null,
+  globalBaseDir: string,
+  globStateDir: string,
+  onlyGlobal: boolean,
+): { targets: UpdateTarget[]; remotes: Manifest["remotes"] } {
+  if (onlyGlobal) {
+    const g = global ?? emptyManifest();
+    return {
+      remotes: g.remotes,
+      targets: g.skills.map((skill) => ({ skill, baseDir: globalBaseDir, stateDir: globStateDir })),
+    };
+  }
+
+  const merged = mergeManifests(project ?? emptyManifest(), global ?? emptyManifest());
+  const projectNames = new Set((project?.skills ?? []).map((s) => s.name));
+  return {
+    remotes: merged.remotes,
+    targets: merged.skills.map((skill) => ({
+      skill,
+      baseDir: projectNames.has(skill.name) ? projectBaseDir : globalBaseDir,
+      stateDir: projectNames.has(skill.name) ? projStateDir : globStateDir,
+    })),
+  };
+}
+
+/**
+ * Three-way merge a single skill's upstream changes into its live dest and
+ * advance its base on a clean merge. Snapshots the live copy first, stages the
+ * merged tree, swaps it into place atomically, then writes state last. A
+ * conflicting merge throws before touching dest, base, or state.
+ */
+async function updateSkill(
+  target: UpdateTarget,
+  remotes: Manifest["remotes"],
+  home: string,
+  refOverride: string | undefined,
+): Promise<void> {
+  const { skill, baseDir, stateDir } = target;
+  const remote = remotes[skill.remote];
+  if (remote === undefined) {
+    throw new ManifestValidationError(
+      `skill '${skill.name}' references unknown remote '${skill.remote}'`,
+    );
+  }
+
+  const dest = expandDest(skill.dest, { home, baseDir });
+  // Finish any swap interrupted by an earlier crash before reading dest.
+  await recoverPendingSwap(dest);
+
+  const repoPath = await ensureRemoteClone(cacheDir(stateDir), remote.repo);
+  const ref = refOverride ?? remote.ref ?? "HEAD";
+  const sha = await resolveRef(repoPath, ref);
+
+  const state = await readState(statePath(stateDir));
+  const prev = state.skills[skill.name];
+  if (prev !== undefined && prev.sha === sha) {
+    process.stdout.write(`${pc.bold(skill.name)} is up to date.\n`);
+    return;
+  }
+
+  // Materialize upstream into a scratch dir we only read from.
+  const upstreamDir = await mkdtemp(join(tmpdir(), "skync-upstream-"));
+  try {
+    await materializeSrc(repoPath, sha, skill.src, upstreamDir);
+
+    const [base, upstream, local] = await Promise.all([
+      readTree(baseSkillDir(stateDir, skill.name)),
+      readTree(upstreamDir),
+      readTree(dest),
+    ]);
+
+    const result = mergeTrees(base, upstream, local);
+    if (!result.clean) {
+      const paths = result.conflicts.map((c) => c.path).join(", ");
+      throw new MergeConflictError(
+        `update for '${skill.name}' has conflicts in: ${paths}. ` +
+          "Resolving conflicts is not yet supported.",
+      );
+    }
+
+    // Snapshot the live copy before mutating dest, so the update is reversible.
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    await snapshotLocal(backupSnapshotDir(stateDir, skill.name, timestamp), dest);
+
+    // Stage the merged tree in dest's parent, then swap it into place atomically.
+    const staging = stagingPathFor(dest);
+    await rm(staging, { recursive: true, force: true });
+    await writeTree(staging, result.merged);
+    await swapDirAtomic(dest, staging);
+
+    // Base advances to the upstream tree (the new merge base) on a clean merge.
+    await populateBase(baseSkillDir(stateDir, skill.name), upstreamDir);
+
+    // state.json is the commit point: write it last.
+    state.skills[skill.name] = {
+      remote: skill.remote,
+      src: skill.src,
+      dest: skill.dest,
+      sha,
+      syncedAt: new Date().toISOString(),
+    };
+    await writeState(statePath(stateDir), state);
+
+    process.stdout.write(`Updated ${pc.bold(skill.name)} to ${sha.slice(0, 12)}\n`);
+  } finally {
+    await rm(upstreamDir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * `skync update [name]`: pull upstream changes for one skill (or all tracked
+ * skills) via a three-way merge, applying only non-overlapping changes. A skill
+ * whose merge conflicts is reported and aborts with a non-zero exit.
+ */
+async function runUpdate(name: string | undefined, options: UpdateOptions): Promise<void> {
+  const home = homedir();
+  const projectPath = projectManifestPath();
+  const globalPath = globalManifestPath(home);
+
+  const [project, global] = await Promise.all([
+    loadManifestFile(projectPath),
+    loadManifestFile(globalPath),
+  ]);
+
+  const { targets, remotes } = resolveUpdateTargets(
+    project,
+    manifestBaseDir(projectPath),
+    projectStateDir(),
+    global,
+    manifestBaseDir(globalPath),
+    globalStateDir(home),
+    options.global === true,
+  );
+
+  let selected = targets;
+  if (name !== undefined) {
+    selected = targets.filter((t) => t.skill.name === name);
+    if (selected.length === 0) {
+      throw new ManifestValidationError(`no tracked skill named '${name}'`);
+    }
+  }
+
+  if (selected.length === 0) {
+    process.stdout.write("No tracked skills to update.\n");
+    return;
+  }
+
+  for (const target of selected) {
+    await updateSkill(target, remotes, home, options.ref);
+  }
+}
+
 function buildProgram(): Command {
   const program = new Command();
   program
@@ -225,6 +408,15 @@ function buildProgram(): Command {
       await runAdd(name, options);
     });
 
+  program
+    .command("update [name]")
+    .description("Pull non-overlapping upstream changes for one or all tracked skills.")
+    .option("--ref <ref>", "branch, tag, or commit to update to (default: the remote's ref)")
+    .option("--global", "update only globally tracked skills")
+    .action(async (name: string | undefined, options: UpdateOptions) => {
+      await runUpdate(name, options);
+    });
+
   return program;
 }
 
@@ -235,8 +427,9 @@ async function main(): Promise<void> {
 
 // Exit codes: 0 success, 1 validation/operational error; richer codes (e.g. for
 // check) arrive in a later issue. Every error class (ManifestValidationError,
-// RemoteCacheError, StateValidationError, GitError) is a plain Error, so a
-// single handler prints its message (never a stack trace) and sets exit 1.
+// RemoteCacheError, StateValidationError, GitError, MergeConflictError) is a
+// plain Error, so a single handler prints its message (never a stack trace) and
+// sets exit 1.
 main().catch((err: unknown) => {
   const message = err instanceof Error ? err.message : String(err);
   process.stderr.write(`${pc.red("error")}: ${message}\n`);
