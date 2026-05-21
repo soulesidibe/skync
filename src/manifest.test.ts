@@ -5,6 +5,8 @@ import {
   expandDest,
   slugFromRepo,
   findOrCreateRemote,
+  upsertSkill,
+  serializeManifest,
   ManifestValidationError,
   type Manifest,
   type Remote,
@@ -269,5 +271,58 @@ describe("findOrCreateRemote", () => {
     const existing = { a: { repo: "https://github.com/x/a.git" } };
     findOrCreateRemote(existing, { repo: "https://github.com/x/b.git" });
     expect(Object.keys(existing)).toEqual(["a"]);
+  });
+});
+
+describe("upsertSkill", () => {
+  const skill = (name: string, src: string) => ({
+    name,
+    remote: "r",
+    src,
+    dest: `~/.claude/skills/${name}`,
+  });
+
+  it("appends a new skill", () => {
+    const m: Manifest = { remotes: { r: { repo: "u" } }, skills: [skill("a", "a")] };
+    const out = upsertSkill(m, skill("b", "b"));
+    expect(out.skills.map((s) => s.name)).toEqual(["a", "b"]);
+  });
+
+  it("replaces an existing skill in place without duplicating", () => {
+    const m: Manifest = {
+      remotes: { r: { repo: "u" } },
+      skills: [skill("a", "old"), skill("b", "b")],
+    };
+    const out = upsertSkill(m, skill("a", "new"));
+    expect(out.skills.map((s) => s.name)).toEqual(["a", "b"]);
+    expect(out.skills[0].src).toBe("new");
+  });
+
+  it("does not mutate the input", () => {
+    const m: Manifest = { remotes: {}, skills: [skill("a", "a")] };
+    upsertSkill(m, skill("a", "new"));
+    expect(m.skills[0].src).toBe("a");
+  });
+});
+
+describe("serializeManifest", () => {
+  it("round-trips through parseManifest", () => {
+    const m: Manifest = {
+      remotes: { pocock: { repo: "https://github.com/mattpocock/skills.git", ref: "main" } },
+      skills: [
+        { name: "gridmy", remote: "pocock", src: "skills/gridmy", dest: "~/.claude/skills/gridmy" },
+      ],
+    };
+    expect(parseManifest(serializeManifest(m))).toEqual(m);
+  });
+
+  it("is idempotent and orders remote keys deterministically", () => {
+    const m: Manifest = {
+      remotes: { zeta: { repo: "z" }, alpha: { repo: "a" } },
+      skills: [],
+    };
+    const once = serializeManifest(m);
+    expect(serializeManifest(parseManifest(once))).toBe(once);
+    expect(once.indexOf("alpha")).toBeLessThan(once.indexOf("zeta"));
   });
 });

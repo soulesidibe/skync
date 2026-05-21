@@ -1,0 +1,129 @@
+import { cp, mkdir, readFile, rename, rm } from "node:fs/promises";
+import { dirname } from "node:path";
+import { writeFileAtomic } from "./atomic.js";
+import { isNotFound, isPlainObject } from "./util.js";
+
+/** Current on-disk state schema version, for forward migration. */
+export const STATE_VERSION = 1;
+
+/**
+ * Per-skill sync state: which remote/src/dest the skill maps to, the concrete
+ * upstream commit SHA last synced (the future merge-base pointer), and when.
+ *
+ * `remote`/`src`/`dest` deliberately mirror the manifest so state is
+ * self-contained: a later sync can trust state.json even if the manifest entry
+ * was hand-edited or removed. `sha`/`syncedAt` live only here.
+ */
+export interface SkillState {
+  remote: string;
+  src: string;
+  dest: string;
+  sha: string;
+  syncedAt: string;
+}
+
+/** The whole state file: a version plus per-skill records keyed by skill name. */
+export interface SkyncState {
+  version: number;
+  skills: Record<string, SkillState>;
+}
+
+/**
+ * Thrown when state.json is present but structurally invalid. The message is
+ * intended to be shown directly to the user.
+ */
+export class StateValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "StateValidationError";
+  }
+}
+
+/** A fresh, empty state at the current version. */
+export function emptyState(): SkyncState {
+  return { version: STATE_VERSION, skills: {} };
+}
+
+function validateState(raw: unknown): SkyncState {
+  if (!isPlainObject(raw)) {
+    throw new StateValidationError("state.json root must be an object");
+  }
+  if (typeof raw.version !== "number") {
+    throw new StateValidationError("state.json is missing a numeric 'version'");
+  }
+  const skills: Record<string, SkillState> = {};
+  const rawSkills = raw.skills;
+  if (rawSkills !== undefined && rawSkills !== null) {
+    if (!isPlainObject(rawSkills)) {
+      throw new StateValidationError("state.json 'skills' must be an object");
+    }
+    for (const [name, value] of Object.entries(rawSkills)) {
+      if (!isPlainObject(value)) {
+        throw new StateValidationError(`state for skill '${name}' must be an object`);
+      }
+      const fields: Array<keyof SkillState> = ["remote", "src", "dest", "sha", "syncedAt"];
+      for (const field of fields) {
+        if (typeof value[field] !== "string" || (value[field] as string).length === 0) {
+          throw new StateValidationError(
+            `state for skill '${name}' is missing a '${field}' string`,
+          );
+        }
+      }
+      skills[name] = {
+        remote: value.remote as string,
+        src: value.src as string,
+        dest: value.dest as string,
+        sha: value.sha as string,
+        syncedAt: value.syncedAt as string,
+      };
+    }
+  }
+  return { version: raw.version, skills };
+}
+
+/**
+ * Read the state file at `path`. Returns an empty state when the file does not
+ * exist; throws StateValidationError on malformed content.
+ */
+export async function readState(path: string): Promise<SkyncState> {
+  let text: string;
+  try {
+    text = await readFile(path, "utf8");
+  } catch (err) {
+    if (isNotFound(err)) {
+      return emptyState();
+    }
+    throw err;
+  }
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new StateValidationError(`could not parse state.json: ${detail}`);
+  }
+  return validateState(raw);
+}
+
+/**
+ * Write the state file atomically. This is the commit point of an operation and
+ * should be the last write.
+ */
+export async function writeState(path: string, state: SkyncState): Promise<void> {
+  await writeFileAtomic(path, `${JSON.stringify(state, null, 2)}\n`);
+}
+
+/**
+ * Populate a skill's `base` tree from a source directory. Copies into a temp
+ * dir alongside the target (same filesystem) then renames into place, removing
+ * any stale base first. Base population is not the commit point; write state
+ * last so a crash never leaves state pointing at an incomplete base.
+ */
+export async function populateBase(baseSkillDir: string, srcDir: string): Promise<void> {
+  await mkdir(dirname(baseSkillDir), { recursive: true });
+  const tmp = `${baseSkillDir}.tmp-${process.pid}-${Date.now()}`;
+  await rm(tmp, { recursive: true, force: true });
+  await cp(srcDir, tmp, { recursive: true });
+  await rm(baseSkillDir, { recursive: true, force: true });
+  await rename(tmp, baseSkillDir);
+}
