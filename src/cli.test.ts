@@ -194,23 +194,44 @@ describe("skync add (CLI)", () => {
     }
   });
 
-  it("errors and exits 1 when dest already exists and is not empty", async () => {
+  it("adopts an existing non-empty dest: leaves it untouched, seeds base from upstream", async () => {
     const fixture = await createFixtureRepo();
     const work = await mkdtemp(join(tmpdir(), "skync-add-"));
     const home = await mkdtemp(join(tmpdir(), "skync-home-"));
     try {
+      // A pre-existing, locally-modified dest. Its content diverges from
+      // upstream and it carries an extra file that upstream does not have.
       await mkdir(join(work, "vendor/demo"), { recursive: true });
-      await writeFile(join(work, "vendor/demo/local.md"), "mine\n");
+      await writeFile(join(work, "vendor/demo/SKILL.md"), "mine\n");
+      await writeFile(join(work, "vendor/demo/local.md"), "local only\n");
 
       const res = await runCli(
         ["add", "demo", "--repo", fixture.url, "--src", "skills/demo", "--dest", "vendor/demo"],
         work,
         home,
       );
-      expect(res.code).toBe(1);
-      expect(res.stderr).toMatch(/already exists/);
-      expect(res.stderr).toMatch(/not yet supported/);
-      expect(res.stderr).not.toMatch(/at .*\(.*:\d+:\d+\)/);
+      expect(res.code).toBe(0);
+
+      // dest is adopted as-is: local edits and local-only files survive.
+      expect(await readFile(join(work, "vendor/demo/SKILL.md"), "utf8")).toBe("mine\n");
+      expect(await readFile(join(work, "vendor/demo/local.md"), "utf8")).toBe("local only\n");
+
+      // base is seeded from current upstream, not from the adopted dest.
+      expect(await readFile(join(work, ".skync/base/demo/SKILL.md"), "utf8")).toBe("demo v1\n");
+
+      // manifest gained the skill.
+      const manifest = await readFile(join(work, "skync.yaml"), "utf8");
+      expect(manifest).toContain("name: demo");
+      expect(manifest).toContain("src: skills/demo");
+
+      // state.json recorded the resolved upstream SHA.
+      const state = JSON.parse(await readFile(join(work, ".skync/state.json"), "utf8"));
+      expect(state.skills.demo.sha).toMatch(/^[0-9a-f]{40}$/);
+
+      // output communicates the adopt path and the predating-changes limitation.
+      expect(res.stdout).toMatch(/adopted/i);
+      expect(res.stdout).toMatch(/kept existing/i);
+      expect(res.stdout).toMatch(/baked into base/i);
     } finally {
       await rm(fixture.dir, { recursive: true, force: true });
       await rm(work, { recursive: true, force: true });

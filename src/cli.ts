@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { homedir } from "node:os";
 import { isAbsolute } from "node:path";
-import { readdir, stat } from "node:fs/promises";
+import { readdir, rm, stat } from "node:fs/promises";
 import { Command } from "commander";
 import pc from "picocolors";
 import {
@@ -122,10 +122,16 @@ async function destOccupied(path: string): Promise<boolean> {
 }
 
 /**
- * `skync add`: vendor a brand-new skill whose dest does not yet exist. Fetches
- * the remote, resolves the ref to a concrete SHA, writes the src subtree into
- * dest, mirrors it into the base tree, updates the manifest, and records the
- * synced SHA in state.json (written last as the commit point).
+ * `skync add`: register a skill and initialize it. Two paths, decided by whether
+ * dest already holds content:
+ *   - dest absent or empty: vendor fresh. The src subtree is written into dest
+ *     and mirrored into the base tree (base == local == upstream).
+ *   - dest non-empty: adopt it as the local copy untouched, and seed the base
+ *     tree from the current upstream so the first later update is a true
+ *     three-way merge. Upstream changes that predate this add are baked into
+ *     base and will not re-apply on that first update (documented limitation).
+ * Both paths resolve the ref to a concrete SHA, update the manifest, and record
+ * the synced SHA in state.json (written last as the commit point).
  */
 async function runAdd(name: string, options: AddOptions): Promise<void> {
   const home = homedir();
@@ -153,12 +159,7 @@ async function runAdd(name: string, options: AddOptions): Promise<void> {
   }
 
   const dest = expandDest(options.dest, { home, baseDir });
-  if (await destOccupied(dest)) {
-    throw new ManifestValidationError(
-      `dest '${dest}' already exists and is not empty. ` +
-        "Adopting an existing folder is not yet supported.",
-    );
-  }
+  const adopt = await destOccupied(dest);
 
   const { remotes, name: remoteName, ref: remoteRef } = findOrCreateRemote(loaded.remotes, {
     repo: options.repo,
@@ -172,8 +173,22 @@ async function runAdd(name: string, options: AddOptions): Promise<void> {
 
   const repoPath = await ensureRemoteClone(cacheDir(stateDir), options.repo);
   const sha = await resolveRef(repoPath, ref);
-  await materializeSrc(repoPath, sha, options.src, dest);
-  await populateBase(baseSkillDir(stateDir, name), dest);
+  const baseDest = baseSkillDir(stateDir, name);
+  if (adopt) {
+    // Leave dest untouched (it is the adopted local copy). Materialize current
+    // upstream into a temp dir, then mirror it into base. The temp name is kept
+    // distinct from populateBase's own ".tmp-" temp so the two never collide.
+    const tmpUpstream = `${baseDest}.adopt-${process.pid}-${Date.now()}`;
+    try {
+      await materializeSrc(repoPath, sha, options.src, tmpUpstream);
+      await populateBase(baseDest, tmpUpstream);
+    } finally {
+      await rm(tmpUpstream, { recursive: true, force: true });
+    }
+  } else {
+    await materializeSrc(repoPath, sha, options.src, dest);
+    await populateBase(baseDest, dest);
+  }
 
   const updated = upsertSkill(
     { remotes, skills: loaded.skills },
@@ -192,10 +207,22 @@ async function runAdd(name: string, options: AddOptions): Promise<void> {
   };
   await writeState(statePath(stateDir), state);
 
-  process.stdout.write(
-    `Added ${pc.bold(name)} from ${remoteName} at ${sha.slice(0, 12)}\n`,
-  );
-  process.stdout.write(`  ${options.src} ${pc.dim("→")} ${dest}\n`);
+  if (adopt) {
+    process.stdout.write(
+      `Adopted ${pc.bold(name)} from ${remoteName} at ${sha.slice(0, 12)}\n`,
+    );
+    process.stdout.write(`  kept existing ${dest} as the local copy\n`);
+    process.stdout.write(
+      pc.dim(
+        "  base seeded from current upstream; changes made upstream before now are baked into base\n",
+      ),
+    );
+  } else {
+    process.stdout.write(
+      `Added ${pc.bold(name)} from ${remoteName} at ${sha.slice(0, 12)}\n`,
+    );
+    process.stdout.write(`  ${options.src} ${pc.dim("→")} ${dest}\n`);
+  }
 }
 
 function buildProgram(): Command {
@@ -214,7 +241,9 @@ function buildProgram(): Command {
 
   program
     .command("add <name>")
-    .description("Vendor a new skill from a remote repo into a fresh dest.")
+    .description(
+      "Vendor a new skill from a remote repo, adopting an existing dest if one is present.",
+    )
     .requiredOption("--repo <url>", "git repo URL to vendor from")
     .requiredOption("--src <path>", "source path within the repo")
     .requiredOption("--dest <path>", "destination path for the vendored skill")
