@@ -296,7 +296,7 @@ describe("skync update (CLI)", () => {
     }
   });
 
-  it("refuses a conflicting update, exits 1, and leaves dest and base untouched", async () => {
+  it("writes conflict markers in place, exits 2, and does not advance base or state", async () => {
     const fixture = await createFixtureRepo();
     const work = await mkdtemp(join(tmpdir(), "skync-update-"));
     const home = await mkdtemp(join(tmpdir(), "skync-home-"));
@@ -314,14 +314,66 @@ describe("skync update (CLI)", () => {
       await commitToFixture(fixture.dir, { "skills/demo/SKILL.md": "demo upstream\n" }, "edit skill");
 
       const res = await runCli(["update", "demo"], work, home);
-      expect(res.code).toBe(1);
-      expect(res.stderr).toMatch(/conflict/i);
-      expect(res.stderr).not.toMatch(/at .*\(.*:\d+:\d+\)/);
+      expect(res.code).toBe(2);
+      // Names the conflicted skill, the specific file, and points to the exits.
+      expect(res.stdout).toMatch(/conflict/i);
+      expect(res.stdout).toContain("SKILL.md");
+      expect(res.stdout).toMatch(/resolve/i);
+      expect(res.stdout).toMatch(/rollback/i);
 
-      // dest still holds the local edit; base and state SHA unchanged.
-      expect(await readFile(join(work, "vendor/demo/SKILL.md"), "utf8")).toBe("demo local\n");
+      // dest now carries git-style markers with both sides.
+      const dest = await readFile(join(work, "vendor/demo/SKILL.md"), "utf8");
+      expect(dest).toContain("<<<<<<<");
+      expect(dest).toContain("=======");
+      expect(dest).toContain(">>>>>>>");
+      expect(dest).toContain("demo local");
+      expect(dest).toContain("demo upstream");
+
+      // Base and state SHA are NOT advanced while the conflict is unresolved.
       expect(await readFile(join(work, ".skync/base/demo/SKILL.md"), "utf8")).toBe("demo v1\n");
       expect(await demoStateSha(work)).toBe(before);
+
+      // A pre-merge snapshot exists so the user can roll back.
+      const snaps = await readdir(join(work, ".skync/backups/demo"));
+      expect(snaps.length).toBe(1);
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses to update a skill that still has unresolved markers, pointing to resolve/rollback", async () => {
+    const fixture = await createFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-update-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const add = await runCli(
+        ["add", "demo", "--repo", fixture.url, "--src", "skills/demo", "--dest", "vendor/demo"],
+        work,
+        home,
+      );
+      expect(add.code).toBe(0);
+
+      // First conflicting update leaves markers in dest.
+      await writeFile(join(work, "vendor/demo/SKILL.md"), "demo local\n");
+      await commitToFixture(fixture.dir, { "skills/demo/SKILL.md": "demo upstream\n" }, "edit skill");
+      const first = await runCli(["update", "demo"], work, home);
+      expect(first.code).toBe(2);
+      const conflicted = await readFile(join(work, "vendor/demo/SKILL.md"), "utf8");
+
+      // Upstream moves again; a second update must refuse while markers remain.
+      await commitToFixture(fixture.dir, { "skills/demo/SKILL.md": "demo upstream v3\n" }, "edit again");
+      const res = await runCli(["update", "demo"], work, home);
+      expect(res.code).toBe(1);
+      expect(res.stderr).toMatch(/unresolved conflict/i);
+      expect(res.stderr).toMatch(/SKILL.md/);
+      expect(res.stderr).toMatch(/resolve/i);
+      expect(res.stderr).toMatch(/rollback/i);
+      expect(res.stderr).not.toMatch(/at .*\(.*:\d+:\d+\)/);
+
+      // dest is left exactly as it was; the refused update touched nothing.
+      expect(await readFile(join(work, "vendor/demo/SKILL.md"), "utf8")).toBe(conflicted);
     } finally {
       await rm(fixture.dir, { recursive: true, force: true });
       await rm(work, { recursive: true, force: true });

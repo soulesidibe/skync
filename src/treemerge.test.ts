@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { mergeTrees, type Tree } from "./treemerge.js";
+import { containsConflictMarkers } from "./conflict-markers.js";
 
 function file(contents: string, mode = 0o644): { contents: Buffer; mode: number; type: "file" } {
   return { contents: Buffer.from(contents), mode, type: "file" };
@@ -72,8 +73,9 @@ describe("treemerge", () => {
 
     expect(result.clean).toBe(false);
     expect(result.conflicts).toEqual([{ path: "img.bin", kind: "binary" }]);
-    // No corrupted merge written for the conflicted binary.
-    expect(result.merged.has("img.bin")).toBe(false);
+    // Binary cannot carry markers: keep the local bytes intact (no corruption,
+    // no silent loss) and let the conflict report flag it.
+    expect(result.merged.get("img.bin")?.contents).toEqual(Buffer.from([0x00, 0x01, 0xaa]));
   });
 
   it("treats a binary file changed identically on both sides as clean", () => {
@@ -123,6 +125,9 @@ describe("treemerge", () => {
 
     expect(result.clean).toBe(false);
     expect(result.conflicts).toEqual([{ path: "f.txt", kind: "delete-modify" }]);
+    // Never a silent delete: when local deleted, keep the modified upstream side
+    // so the file reappears for the user to reconcile rather than vanishing.
+    expect(result.merged.get("f.txt")?.contents.toString()).toBe("v2\n");
   });
 
   it("deletes a file that upstream removed and local left untouched", () => {
@@ -148,7 +153,40 @@ describe("treemerge", () => {
     expect(result.merged.get("new.txt")?.contents.toString()).toBe("same\n");
   });
 
-  it("reports a divergent add on both sides as an add-add conflict", () => {
+  it("writes git-style markers in place for an overlapping text conflict (local above upstream)", () => {
+    const base = tree({ "f.txt": file("shared\n") });
+    const upstream = tree({ "f.txt": file("upstream change\n") });
+    const local = tree({ "f.txt": file("local change\n") });
+
+    const result = mergeTrees(base, upstream, local);
+
+    expect(result.clean).toBe(false);
+    expect(result.conflicts).toEqual([{ path: "f.txt", kind: "content" }]);
+
+    const merged = result.merged.get("f.txt")?.contents.toString() ?? "";
+    expect(containsConflictMarkers(Buffer.from(merged))).toBe(true);
+    // Local is rendered above the separator, upstream below it.
+    expect(merged).toContain("local change");
+    expect(merged).toContain("upstream change");
+    expect(merged.indexOf("local change")).toBeLessThan(merged.indexOf("upstream change"));
+    expect(merged.indexOf("<<<<<<<")).toBeLessThan(merged.indexOf("======="));
+    expect(merged.indexOf("=======")).toBeLessThan(merged.indexOf(">>>>>>>"));
+  });
+
+  it("preserves the local newline style when writing conflict markers", () => {
+    const base = tree({ "f.txt": file("shared\n") });
+    const upstream = tree({ "f.txt": file("upstream\n") });
+    const local = tree({ "f.txt": file("local\r\n") });
+
+    const result = mergeTrees(base, upstream, local);
+
+    const merged = result.merged.get("f.txt")?.contents.toString() ?? "";
+    // Local used CRLF, so the marked output joins with CRLF throughout.
+    expect(merged).toContain("\r\n");
+    expect(merged).not.toMatch(/[^\r]\n/);
+  });
+
+  it("writes markers for a divergent add on both sides (add-add, empty base)", () => {
     const base = tree({});
     const upstream = tree({ "new.txt": file("from upstream\n") });
     const local = tree({ "new.txt": file("from local\n") });
@@ -157,6 +195,10 @@ describe("treemerge", () => {
 
     expect(result.clean).toBe(false);
     expect(result.conflicts).toEqual([{ path: "new.txt", kind: "add-add" }]);
+    const merged = result.merged.get("new.txt")?.contents.toString() ?? "";
+    expect(containsConflictMarkers(Buffer.from(merged))).toBe(true);
+    expect(merged).toContain("from local");
+    expect(merged).toContain("from upstream");
   });
 
   it("reports a file-vs-directory collision as a type-change conflict", () => {
