@@ -36,10 +36,23 @@ import {
   stagingPathFor,
 } from "./atomic.js";
 import { readTree, writeTree } from "./tree-io.js";
-import { mergeTrees } from "./treemerge.js";
+import { mergeTrees, type Conflict } from "./treemerge.js";
+import { treeConflictMarkerPaths } from "./conflict-markers.js";
 
-/** Thrown when an update cannot auto-merge; conflict resolution arrives later. */
-class MergeConflictError extends Error {}
+/**
+ * Thrown when a skill's live copy still carries unresolved conflict markers, so
+ * an update would stack a merge on top of an unmerged file. The user must run
+ * `skync resolve` or `skync rollback` first. Exits 1 like other operational
+ * errors (distinct from the exit-2 "completed with conflicts" outcome).
+ */
+class UnresolvedConflictError extends Error {}
+
+/** Outcome of updating one skill, aggregated by runUpdate for reporting. */
+interface UpdateOutcome {
+  name: string;
+  status: "up-to-date" | "clean" | "conflict";
+  conflicts: Conflict[];
+}
 
 /**
  * A skill plus the directory of the manifest that declared it, so we can
@@ -282,17 +295,20 @@ function resolveUpdateTargets(
 }
 
 /**
- * Three-way merge a single skill's upstream changes into its live dest and
- * advance its base on a clean merge. Snapshots the live copy first, stages the
- * merged tree, swaps it into place atomically, then writes state last. A
- * conflicting merge throws before touching dest, base, or state.
+ * Three-way merge a single skill's upstream changes into its live dest. Always
+ * snapshots the live copy first, stages the merged tree, and swaps it into place
+ * atomically. On a clean merge, base advances to upstream and state.json records
+ * the new SHA. On a conflicting merge, the dest receives in-place conflict
+ * markers (and kept-local binary/delete sides) but base and state are left
+ * untouched, so the next clean `resolve` advances them. Refuses up front if the
+ * live copy still carries unresolved markers from a prior conflict.
  */
 async function updateSkill(
   target: UpdateTarget,
   remotes: Manifest["remotes"],
   home: string,
   refOverride: string | undefined,
-): Promise<void> {
+): Promise<UpdateOutcome> {
   const { skill, baseDir, stateDir } = target;
   const remote = remotes[skill.remote];
   if (remote === undefined) {
@@ -305,6 +321,18 @@ async function updateSkill(
   // Finish any swap interrupted by an earlier crash before reading dest.
   await recoverPendingSwap(dest);
 
+  // Refuse before any fetch if the live copy still has unresolved markers:
+  // updating would stack a merge on an unmerged file.
+  const live = await readTree(dest);
+  const marked = treeConflictMarkerPaths(live);
+  if (marked.length > 0) {
+    throw new UnresolvedConflictError(
+      `skill '${skill.name}' has unresolved conflict markers in: ${marked.join(", ")}. ` +
+        `Run 'skync resolve ${skill.name}' once you have edited the markers out, ` +
+        `or 'skync rollback ${skill.name}' to discard them.`,
+    );
+  }
+
   const repoPath = await ensureRemoteClone(cacheDir(stateDir), remote.repo);
   const ref = refOverride ?? remote.ref ?? "HEAD";
   const sha = await resolveRef(repoPath, ref);
@@ -313,7 +341,7 @@ async function updateSkill(
   const prev = state.skills[skill.name];
   if (prev !== undefined && prev.sha === sha) {
     process.stdout.write(`${pc.bold(skill.name)} is up to date.\n`);
-    return;
+    return { name: skill.name, status: "up-to-date", conflicts: [] };
   }
 
   // Materialize upstream into a scratch dir we only read from.
@@ -321,22 +349,15 @@ async function updateSkill(
   try {
     await materializeSrc(repoPath, sha, skill.src, upstreamDir);
 
-    const [base, upstream, local] = await Promise.all([
+    const [base, upstream] = await Promise.all([
       readTree(baseSkillDir(stateDir, skill.name)),
       readTree(upstreamDir),
-      readTree(dest),
     ]);
 
-    const result = mergeTrees(base, upstream, local);
-    if (!result.clean) {
-      const paths = result.conflicts.map((c) => c.path).join(", ");
-      throw new MergeConflictError(
-        `update for '${skill.name}' has conflicts in: ${paths}. ` +
-          "Resolving conflicts is not yet supported.",
-      );
-    }
+    const result = mergeTrees(base, upstream, live);
 
-    // Snapshot the live copy before mutating dest, so the update is reversible.
+    // Snapshot the live copy before mutating dest, so the update is reversible
+    // even when it lands conflict markers.
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
     await snapshotLocal(backupSnapshotDir(stateDir, skill.name, timestamp), dest);
 
@@ -345,6 +366,13 @@ async function updateSkill(
     await rm(staging, { recursive: true, force: true });
     await writeTree(staging, result.merged);
     await swapDirAtomic(dest, staging);
+
+    if (!result.clean) {
+      // Conflicts are now in dest. Leave base and state.json untouched so the
+      // merge base does not advance until the conflict is resolved.
+      process.stdout.write(`${pc.bold(skill.name)} has conflicts; markers written to dest.\n`);
+      return { name: skill.name, status: "conflict", conflicts: result.conflicts };
+    }
 
     // Base advances to the upstream tree (the new merge base) on a clean merge.
     await populateBase(baseSkillDir(stateDir, skill.name), upstreamDir);
@@ -360,15 +388,59 @@ async function updateSkill(
     await writeState(statePath(stateDir), state);
 
     process.stdout.write(`Updated ${pc.bold(skill.name)} to ${sha.slice(0, 12)}\n`);
+    return { name: skill.name, status: "clean", conflicts: [] };
   } finally {
     await rm(upstreamDir, { recursive: true, force: true });
   }
 }
 
 /**
+ * Report each conflicted skill: its name, the files carrying in-place markers
+ * (text overlaps and add-add), and any conflicts that cannot carry markers
+ * (binary byte conflicts, delete-vs-modify, file/dir collisions) where the local
+ * side was kept. Closes with the resolve/rollback next steps.
+ */
+function reportConflicts(outcomes: UpdateOutcome[]): void {
+  const conflicted = outcomes.filter((o) => o.status === "conflict");
+  if (conflicted.length === 0) {
+    return;
+  }
+
+  process.stdout.write(`\n${pc.bold("Conflicts need resolving:")}\n`);
+  for (const outcome of conflicted) {
+    process.stdout.write(`  ${pc.bold(outcome.name)}\n`);
+    for (const c of outcome.conflicts) {
+      switch (c.kind) {
+        case "content":
+        case "add-add":
+          process.stdout.write(`    conflict markers in ${c.path}\n`);
+          break;
+        case "binary":
+          process.stdout.write(`    binary conflict in ${c.path} (kept your local copy)\n`);
+          break;
+        case "delete-modify":
+          process.stdout.write(`    delete/modify conflict in ${c.path} (kept the modified version)\n`);
+          break;
+        case "type-change":
+          process.stdout.write(`    path collision in ${c.path} (left unmerged)\n`);
+          break;
+      }
+    }
+  }
+  process.stdout.write(
+    pc.dim(
+      "\nEdit the markers out then run 'skync resolve <name>', " +
+        "or 'skync rollback <name>' to discard the update.\n",
+    ),
+  );
+}
+
+/**
  * `skync update [name]`: pull upstream changes for one skill (or all tracked
- * skills) via a three-way merge, applying only non-overlapping changes. A skill
- * whose merge conflicts is reported and aborts with a non-zero exit.
+ * skills) via a three-way merge. Non-overlapping changes apply silently; an
+ * overlap writes git-style markers in place and the skill is reported as
+ * conflicted (exit 2) without advancing its base. A skill that still carries
+ * unresolved markers is refused (exit 1, via the thrown error).
  */
 async function runUpdate(name: string | undefined, options: UpdateOptions): Promise<void> {
   const home = homedir();
@@ -403,8 +475,17 @@ async function runUpdate(name: string | undefined, options: UpdateOptions): Prom
     return;
   }
 
+  const outcomes: UpdateOutcome[] = [];
   for (const target of selected) {
-    await updateSkill(target, remotes, home, options.ref);
+    outcomes.push(await updateSkill(target, remotes, home, options.ref));
+  }
+
+  reportConflicts(outcomes);
+
+  // Completed, but conflicts await resolution: signal with exit 2, distinct
+  // from operational errors (exit 1, set by the top-level catch).
+  if (outcomes.some((o) => o.status === "conflict")) {
+    process.exitCode = 2;
   }
 }
 
@@ -454,11 +535,12 @@ async function main(): Promise<void> {
   await program.parseAsync(process.argv);
 }
 
-// Exit codes: 0 success, 1 validation/operational error; richer codes (e.g. for
-// check) arrive in a later issue. Every error class (ManifestValidationError,
-// RemoteCacheError, StateValidationError, GitError, MergeConflictError) is a
-// plain Error, so a single handler prints its message (never a stack trace) and
-// sets exit 1.
+// Exit codes: 0 success, 2 completed-with-conflicts (set in runUpdate), 1
+// validation/operational error; richer codes (e.g. for check) arrive in a later
+// issue. Every error class (ManifestValidationError, RemoteCacheError,
+// StateValidationError, GitError, UnresolvedConflictError) is a plain Error, so
+// a single handler prints its message (never a stack trace) and sets exit 1. A
+// thrown error takes precedence over an exit-2 conflict in the same run.
 main().catch((err: unknown) => {
   const message = err instanceof Error ? err.message : String(err);
   process.stderr.write(`${pc.red("error")}: ${message}\n`);
