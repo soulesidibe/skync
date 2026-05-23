@@ -45,8 +45,9 @@ import {
   OLD_DIR_SUFFIX,
 } from "./atomic.js";
 import { readTree, writeTree } from "./tree-io.js";
-import { mergeTrees, type Conflict } from "./treemerge.js";
+import { mergeTrees, type Conflict, type Tree } from "./treemerge.js";
 import { treeConflictMarkerPaths } from "./conflict-markers.js";
+import { compareTrees, formatFileDiff, type TreeDiff } from "./diff-report.js";
 
 /**
  * Thrown when a skill's live copy still carries unresolved conflict markers, so
@@ -903,6 +904,280 @@ async function runCheck(name: string | undefined, options: CheckOptions): Promis
   }
 }
 
+/** Per-skill classification produced by the read-only status sweep. */
+type StatusStatus =
+  | "clean"
+  | "modified"
+  | "pending-conflict"
+  | "dest-missing"
+  | "interrupted-swap"
+  | "no-state";
+
+interface StatusOutcome {
+  name: string;
+  status: StatusStatus;
+  diff?: TreeDiff;
+  markerPaths?: string[];
+  pendingSha?: string;
+  artifact?: string;
+}
+
+/**
+ * Classify one skill against its base for the read-only status sweep. Order
+ * matches `check` for consistency: pending-swap artifact (stop early), then
+ * dest-missing, then no-state, then read trees and diff. Pending-conflict is
+ * the union of `state.pendingSha` set and any in-place conflict markers.
+ */
+async function statusSkill(target: UpdateTarget, home: string): Promise<StatusOutcome> {
+  const { skill, baseDir, stateDir } = target;
+  const dest = expandDest(skill.dest, { home, baseDir });
+
+  const stale = await pendingSwapArtifact(dest);
+  if (stale !== null) {
+    return { name: skill.name, status: "interrupted-swap", artifact: stale };
+  }
+
+  // dest existence: a missing dest can't be diffed against base meaningfully.
+  let destMissing = false;
+  try {
+    await stat(dest);
+  } catch (err) {
+    if (!isNotFound(err)) throw err;
+    destMissing = true;
+  }
+  if (destMissing) {
+    return { name: skill.name, status: "dest-missing" };
+  }
+
+  const state = await readState(statePath(stateDir));
+  const prev = state.skills[skill.name];
+  if (prev === undefined) {
+    return { name: skill.name, status: "no-state" };
+  }
+
+  const [base, local] = await Promise.all([
+    readTree(baseSkillDir(stateDir, skill.name)),
+    readTree(dest),
+  ]);
+  const diff = compareTrees(base, local);
+  const markerPaths = treeConflictMarkerPaths(local);
+  if (prev.pendingSha !== undefined || markerPaths.length > 0) {
+    return {
+      name: skill.name,
+      status: "pending-conflict",
+      diff,
+      markerPaths,
+      pendingSha: prev.pendingSha,
+    };
+  }
+
+  const dirty =
+    diff.added.length + diff.modified.length + diff.deleted.length + diff.typeChanged.length;
+  if (dirty === 0) {
+    return { name: skill.name, status: "clean", diff };
+  }
+  return { name: skill.name, status: "modified", diff };
+}
+
+/**
+ * Format one status outcome as a stable, greppable line. Glyph + bold name +
+ * `[status]` token + counts, matching the `formatCheckLine` voice. Counts
+ * appear as `+added ~modified -deleted` (typeChanged folded into modified for
+ * the headline; the per-file list below names every changed path).
+ */
+function formatStatusLine(o: StatusOutcome): string {
+  const name = pc.bold(o.name);
+  switch (o.status) {
+    case "clean":
+      return `${pc.green("✓")} ${name} [clean]`;
+    case "modified": {
+      const d = o.diff as TreeDiff;
+      const m = d.modified.length + d.typeChanged.length;
+      return `${pc.yellow("~")} ${name} [modified] +${d.added.length} ~${m} -${d.deleted.length}`;
+    }
+    case "pending-conflict": {
+      const d = o.diff as TreeDiff;
+      const m = d.modified.length + d.typeChanged.length;
+      const detail =
+        (o.markerPaths ?? []).length > 0
+          ? ` markers in: ${(o.markerPaths ?? []).join(", ")}`
+          : o.pendingSha !== undefined
+            ? ` pending upstream ${o.pendingSha.slice(0, 12)}`
+            : "";
+      return `${pc.red("!")} ${name} [pending-conflict] +${d.added.length} ~${m} -${d.deleted.length}${detail}`;
+    }
+    case "dest-missing":
+      return `${pc.red("!")} ${name} [dest-missing]`;
+    case "interrupted-swap":
+      return `${pc.red("!")} ${name} [interrupted-swap] at ${o.artifact} (run 'skync update' to recover)`;
+    case "no-state":
+      return `${pc.dim("∅")} ${pc.bold(o.name)} [no-state]`;
+  }
+}
+
+/**
+ * Emit indented per-file change lines below the headline, so the human reader
+ * sees both the at-a-glance counts and the specific paths touched. Sorted by
+ * compareTrees already.
+ */
+function formatStatusDetail(d: TreeDiff): string {
+  const out: string[] = [];
+  for (const p of d.added) out.push(`    ${pc.green("+")} ${p}`);
+  for (const p of d.modified) out.push(`    ${pc.yellow("~")} ${p}`);
+  for (const p of d.typeChanged) out.push(`    ${pc.yellow("T")} ${p}`);
+  for (const p of d.deleted) out.push(`    ${pc.red("-")} ${p}`);
+  return out.length === 0 ? "" : `${out.join("\n")}\n`;
+}
+
+interface StatusOptions {
+  global?: boolean;
+}
+
+/**
+ * `skync status [name]`: per-skill report of local-vs-base modifications plus
+ * pending-conflict flagging. Read-only: no fetch, no writes to dest, base,
+ * state, or manifests. Always exits 0; operational errors (unknown name,
+ * malformed manifest) exit 1 via the global handler.
+ */
+async function runStatus(name: string | undefined, options: StatusOptions): Promise<void> {
+  const home = homedir();
+  const projectPath = projectManifestPath();
+  const globalPath = globalManifestPath(home);
+
+  const [project, global] = await Promise.all([
+    loadManifestFile(projectPath),
+    loadManifestFile(globalPath),
+  ]);
+
+  const { targets } = resolveUpdateTargets(
+    project,
+    manifestBaseDir(projectPath),
+    projectStateDir(),
+    global,
+    manifestBaseDir(globalPath),
+    globalStateDir(home),
+    options.global === true,
+  );
+
+  let selected = targets;
+  if (name !== undefined) {
+    selected = targets.filter((t) => t.skill.name === name);
+    if (selected.length === 0) {
+      throw new ManifestValidationError(`no tracked skill named '${name}'`);
+    }
+  }
+
+  if (selected.length === 0) {
+    process.stdout.write("No tracked skills.\n");
+    return;
+  }
+
+  for (const target of selected) {
+    const outcome = await statusSkill(target, home);
+    process.stdout.write(`${formatStatusLine(outcome)}\n`);
+    if (outcome.diff !== undefined) {
+      process.stdout.write(formatStatusDetail(outcome.diff));
+    }
+  }
+}
+
+/**
+ * `skync diff <name>`: show local-vs-base and upstream-vs-base diffs for one
+ * skill. Read-only with respect to dest, base, state, and manifests (the
+ * remote cache may be fetched into, identical to `check`/`update` behavior).
+ * Network or git failures exit 1 rather than silently omitting the upstream
+ * side, because a partial diff would mislead the user into thinking upstream
+ * had not moved.
+ */
+async function runDiff(name: string): Promise<void> {
+  const home = homedir();
+  const projectPath = projectManifestPath();
+  const globalPath = globalManifestPath(home);
+
+  const [project, global] = await Promise.all([
+    loadManifestFile(projectPath),
+    loadManifestFile(globalPath),
+  ]);
+
+  const { targets, remotes } = resolveUpdateTargets(
+    project,
+    manifestBaseDir(projectPath),
+    projectStateDir(),
+    global,
+    manifestBaseDir(globalPath),
+    globalStateDir(home),
+    false,
+  );
+
+  const target = targets.find((t) => t.skill.name === name);
+  if (target === undefined) {
+    throw new ManifestValidationError(`no tracked skill named '${name}'`);
+  }
+  const { skill, baseDir, stateDir } = target;
+  const dest = expandDest(skill.dest, { home, baseDir });
+
+  const stale = await pendingSwapArtifact(dest);
+  if (stale !== null) {
+    throw new ManifestValidationError(
+      `skill '${skill.name}' has a pending atomic-swap artifact at ${stale}. ` +
+        `Run 'skync update' to recover before running diff.`,
+    );
+  }
+
+  const remote = remotes[skill.remote];
+  if (remote === undefined) {
+    throw new ManifestValidationError(
+      `skill '${skill.name}' references unknown remote '${skill.remote}'`,
+    );
+  }
+
+  const [base, local] = await Promise.all([
+    readTree(baseSkillDir(stateDir, skill.name)),
+    readTree(dest),
+  ]);
+
+  // Materialize upstream into a scratch dir we only read from. mkdtemp + rm in
+  // finally mirrors check/update.
+  const upstreamDir = await mkdtemp(join(tmpdir(), "skync-diff-"));
+  try {
+    const repoPath = await ensureRemoteClone(cacheDir(stateDir), remote.repo);
+    const ref = remote.ref ?? "HEAD";
+    const sha = await resolveRef(repoPath, ref);
+    await materializeSrc(repoPath, sha, skill.src, upstreamDir);
+    const upstream = await readTree(upstreamDir);
+
+    process.stdout.write(`${pc.bold(skill.name)}\n`);
+    writeDiffSection("local vs base", base, local);
+    writeDiffSection(`upstream vs base (${sha.slice(0, 12)})`, base, upstream);
+  } finally {
+    await rm(upstreamDir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Emit one labelled diff section: header plus per-file blocks for every changed
+ * path. Empty section prints a single "no changes" line so the user sees both
+ * sides were considered.
+ */
+function writeDiffSection(label: string, base: Tree, other: Tree): void {
+  const d = compareTrees(base, other);
+  process.stdout.write(`  ${pc.bold(label)}:\n`);
+  const paths = [...d.added, ...d.modified, ...d.deleted, ...d.typeChanged].sort();
+  if (paths.length === 0) {
+    process.stdout.write(`    ${pc.dim("(no changes)")}\n`);
+    return;
+  }
+  for (const path of paths) {
+    const block = formatFileDiff({ path, base: base.get(path), other: other.get(path) });
+    // Indent each line of the block under the section header for readability.
+    const indented = block
+      .split("\n")
+      .map((l, i, arr) => (i === arr.length - 1 && l === "" ? l : `    ${l}`))
+      .join("\n");
+    process.stdout.write(indented);
+  }
+}
+
 function buildProgram(): Command {
   const program = new Command();
   program
@@ -958,6 +1233,21 @@ function buildProgram(): Command {
     .option("--global", "check only globally tracked skills")
     .action(async (name: string | undefined, options: CheckOptions) => {
       await runCheck(name, options);
+    });
+
+  program
+    .command("status [name]")
+    .description("Per-skill local-vs-base modifications plus pending-conflict flagging (read-only).")
+    .option("--global", "report only globally tracked skills")
+    .action(async (name: string | undefined, options: StatusOptions) => {
+      await runStatus(name, options);
+    });
+
+  program
+    .command("diff <name>")
+    .description("Show local-vs-base and upstream-vs-base diffs for one skill (read-only).")
+    .action(async (name: string) => {
+      await runDiff(name);
     });
 
   return program;
