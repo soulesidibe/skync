@@ -1056,6 +1056,326 @@ describe("skync check (CLI)", () => {
   });
 });
 
+/**
+ * Seed N fake snapshot dirs into a backup directory so retention pruning has
+ * something to prune. Returns the timestamps in chronological order. The dirs
+ * are empty (no dest/base/meta); retention only cares about the directory
+ * names matching the timestamp shape.
+ */
+async function seedFakeSnapshots(backupDir: string, count: number): Promise<string[]> {
+  await mkdir(backupDir, { recursive: true });
+  const created: string[] = [];
+  for (let i = 0; i < count; i++) {
+    const yy = String(2020 + Math.floor(i / 60)).padStart(4, "0");
+    const min = String(i % 60).padStart(2, "0");
+    const ts = `${yy}-01-01T00-${min}-00-000Z`;
+    await mkdir(join(backupDir, ts), { recursive: true });
+    await writeFile(join(backupDir, ts, "marker"), `${i}\n`);
+    created.push(ts);
+  }
+  return created;
+}
+
+describe("skync rollback (CLI)", () => {
+  it("lists snapshots newest-first when --to is omitted, exits 0", async () => {
+    const fixture = await createFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-rb-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const add = await runCli(
+        ["add", "demo", "--repo", fixture.url, "--src", "skills/demo", "--dest", "vendor/demo"],
+        work,
+        home,
+      );
+      expect(add.code).toBe(0);
+      const backupDir = join(work, ".skync/backups/demo");
+      const created = await seedFakeSnapshots(backupDir, 3);
+
+      const res = await runCli(["rollback", "demo"], work, home);
+      expect(res.code).toBe(0);
+      const lines = res.stdout.trim().split("\n");
+      expect(lines[0]).toMatch(/snapshots for/i);
+      expect(lines[1]).toContain(`1. ${created[2]}`);
+      expect(lines[2]).toContain(`2. ${created[1]}`);
+      expect(lines[3]).toContain(`3. ${created[0]}`);
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("reports 'no snapshots' (exit 0) when none exist", async () => {
+    const fixture = await createFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-rb-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const add = await runCli(
+        ["add", "demo", "--repo", fixture.url, "--src", "skills/demo", "--dest", "vendor/demo"],
+        work,
+        home,
+      );
+      expect(add.code).toBe(0);
+      const res = await runCli(["rollback", "demo"], work, home);
+      expect(res.code).toBe(0);
+      expect(res.stdout).toMatch(/no snapshots/i);
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("errors (exit 1) on an unknown skill name", async () => {
+    const work = await mkdtemp(join(tmpdir(), "skync-rb-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const res = await runCli(["rollback", "ghost"], work, home);
+      expect(res.code).toBe(1);
+      expect(res.stderr).toMatch(/no tracked skill named 'ghost'/i);
+    } finally {
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("errors (exit 1) on a --to value that is not a valid snapshot timestamp shape", async () => {
+    const fixture = await createFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-rb-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const add = await runCli(
+        ["add", "demo", "--repo", fixture.url, "--src", "skills/demo", "--dest", "vendor/demo"],
+        work,
+        home,
+      );
+      expect(add.code).toBe(0);
+      // A path-traversal value must be refused before any filesystem join.
+      const res = await runCli(
+        ["rollback", "demo", "--to", "../etc/passwd"],
+        work,
+        home,
+      );
+      expect(res.code).toBe(1);
+      expect(res.stderr).toMatch(/not a valid snapshot timestamp/i);
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("errors (exit 1) on an unknown --to timestamp and lists available", async () => {
+    const fixture = await createFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-rb-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const add = await runCli(
+        ["add", "demo", "--repo", fixture.url, "--src", "skills/demo", "--dest", "vendor/demo"],
+        work,
+        home,
+      );
+      expect(add.code).toBe(0);
+      const created = await seedFakeSnapshots(join(work, ".skync/backups/demo"), 2);
+
+      const res = await runCli(
+        ["rollback", "demo", "--to", "1999-01-01T00-00-00-000Z"],
+        work,
+        home,
+      );
+      expect(res.code).toBe(1);
+      expect(res.stderr).toMatch(/no snapshot '1999-01-01T00-00-00-000Z'/);
+      for (const ts of created) expect(res.stderr).toContain(ts);
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("restores dest + base + state from --to, and the next update is a no-op", async () => {
+    const fixture = await createFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-rb-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const add = await runCli(
+        ["add", "demo", "--repo", fixture.url, "--src", "skills/demo", "--dest", "vendor/demo"],
+        work,
+        home,
+      );
+      expect(add.code).toBe(0);
+      const initialSha = await demoStateSha(work);
+
+      // Upstream advances cleanly; update applies EXTRA.md and advances base+state.
+      await commitToFixture(fixture.dir, { "skills/demo/EXTRA.md": "extra\n" }, "add extra");
+      const upd = await runCli(["update", "demo"], work, home);
+      expect(upd.code).toBe(0);
+
+      expect(await readFile(join(work, "vendor/demo/EXTRA.md"), "utf8")).toBe("extra\n");
+      const updatedSha = await demoStateSha(work);
+      expect(updatedSha).not.toBe(initialSha);
+
+      const snaps = await readdir(join(work, ".skync/backups/demo"));
+      expect(snaps.length).toBe(1);
+      const snapshotTs = snaps[0];
+
+      const rb = await runCli(["rollback", "demo", "--to", snapshotTs], work, home);
+      expect(rb.code).toBe(0);
+      expect(rb.stdout).toMatch(/restored/i);
+
+      // dest reverted: EXTRA.md gone, SKILL.md unchanged from initial.
+      await expect(readFile(join(work, "vendor/demo/EXTRA.md"), "utf8")).rejects.toThrow();
+      expect(await readFile(join(work, "vendor/demo/SKILL.md"), "utf8")).toBe("demo v1\n");
+
+      // base reverted: no EXTRA.md (this is the B3 fix: rollback restores base too).
+      await expect(
+        readFile(join(work, ".skync/base/demo/EXTRA.md"), "utf8"),
+      ).rejects.toThrow();
+
+      // state reverted: sha back to the initial value (proves meta restore).
+      expect(await demoStateSha(work)).toBe(initialSha);
+
+      // A safety snapshot was added by rollback so the rollback is reversible.
+      const snapsAfter = await readdir(join(work, ".skync/backups/demo"));
+      expect(snapsAfter.length).toBe(2);
+
+      // Subsequent update against the same upstream re-merges cleanly: no
+      // spurious conflicts because base was rewound in sync with dest+state.
+      const upd2 = await runCli(["update", "demo"], work, home);
+      expect(upd2.code).toBe(0);
+      expect(upd2.stdout).not.toMatch(/conflict/i);
+      expect(await readFile(join(work, "vendor/demo/EXTRA.md"), "utf8")).toBe("extra\n");
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("skync update retention", () => {
+  it("default --keep 10 prunes excess snapshots after a clean update", async () => {
+    const fixture = await createFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-ret-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const add = await runCli(
+        ["add", "demo", "--repo", fixture.url, "--src", "skills/demo", "--dest", "vendor/demo"],
+        work,
+        home,
+      );
+      expect(add.code).toBe(0);
+
+      // Seed 11 old snapshots; the update adds one (=12 total) then prunes
+      // back to the default 10.
+      await seedFakeSnapshots(join(work, ".skync/backups/demo"), 11);
+
+      await commitToFixture(fixture.dir, { "skills/demo/EXTRA.md": "extra\n" }, "add extra");
+      const upd = await runCli(["update", "demo"], work, home);
+      expect(upd.code).toBe(0);
+
+      const remaining = await readdir(join(work, ".skync/backups/demo"));
+      expect(remaining.length).toBe(10);
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("--keep 3 prunes to exactly 3", async () => {
+    const fixture = await createFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-ret-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const add = await runCli(
+        ["add", "demo", "--repo", fixture.url, "--src", "skills/demo", "--dest", "vendor/demo"],
+        work,
+        home,
+      );
+      expect(add.code).toBe(0);
+
+      await seedFakeSnapshots(join(work, ".skync/backups/demo"), 5);
+      await commitToFixture(fixture.dir, { "skills/demo/EXTRA.md": "extra\n" }, "add extra");
+      const upd = await runCli(["update", "demo", "--keep", "3"], work, home);
+      expect(upd.code).toBe(0);
+
+      const remaining = await readdir(join(work, ".skync/backups/demo"));
+      expect(remaining.length).toBe(3);
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects --keep 0 with a clear error and prunes nothing", async () => {
+    const fixture = await createFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-ret-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const add = await runCli(
+        ["add", "demo", "--repo", fixture.url, "--src", "skills/demo", "--dest", "vendor/demo"],
+        work,
+        home,
+      );
+      expect(add.code).toBe(0);
+      const seeded = await seedFakeSnapshots(join(work, ".skync/backups/demo"), 5);
+
+      const res = await runCli(["update", "demo", "--keep", "0"], work, home);
+      expect(res.code).toBe(1);
+      expect(res.stderr).toMatch(/--keep/i);
+      const remaining = await readdir(join(work, ".skync/backups/demo"));
+      expect(remaining.sort()).toEqual(seeded.sort());
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("does not prune on a conflicting update so the recovery snapshot survives", async () => {
+    const { fixture, work, home } = await setupConflict();
+    try {
+      // After setupConflict: state has pendingSha, one snapshot exists.
+      // Seed more older snapshots and run another update — it refuses on
+      // pendingSha, and crucially must NOT prune. All snapshots remain.
+      const seeded = await seedFakeSnapshots(join(work, ".skync/backups/demo"), 15);
+
+      const res = await runCli(["update", "demo"], work, home);
+      expect(res.code).toBe(1);
+      expect(res.stderr).toMatch(/unresolved conflict/i);
+
+      const remaining = await readdir(join(work, ".skync/backups/demo"));
+      expect(remaining.length).toBe(16);
+      for (const ts of seeded) expect(remaining).toContain(ts);
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("skync resolve retention", () => {
+  it("prunes older snapshots after a successful resolve", async () => {
+    const { fixture, work, home } = await setupConflict();
+    try {
+      await seedFakeSnapshots(join(work, ".skync/backups/demo"), 15);
+      await writeFile(join(work, "vendor/demo/SKILL.md"), "merged content\n");
+      const res = await runCli(["resolve", "demo"], work, home);
+      expect(res.code).toBe(0);
+
+      const remaining = await readdir(join(work, ".skync/backups/demo"));
+      expect(remaining.length).toBe(10);
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("skync status (CLI)", () => {
   it("prints an empty-state message and exits 0 with no manifests", async () => {
     const work = await mkdtemp(join(tmpdir(), "skync-status-"));
