@@ -29,7 +29,15 @@ import {
   statePath,
 } from "./paths.js";
 import { ensureRemoteClone, resolveRef, materializeSrc } from "./remote-cache.js";
-import { readState, writeState, populateBase, snapshotLocal } from "./state-store.js";
+import {
+  readState,
+  writeState,
+  populateBase,
+  snapshotLocal,
+  markPending,
+  commitResolution,
+} from "./state-store.js";
+import { git } from "./git.js";
 import {
   swapDirAtomic,
   recoverPendingSwap,
@@ -321,15 +329,26 @@ async function updateSkill(
   // Finish any swap interrupted by an earlier crash before reading dest.
   await recoverPendingSwap(dest);
 
-  // Refuse before any fetch if the live copy still has unresolved markers:
-  // updating would stack a merge on an unmerged file.
+  // Refuse before any fetch if a prior update left an unresolved conflict.
+  // Two signals: pendingSha in state.json is the canonical flag (it outlives
+  // text markers and covers binary/delete-modify/type-change conflicts that
+  // leave nothing detectable in dest), and any actual marker triples in dest.
+  // Either is grounds to refuse; updating would stack a merge on an unmerged
+  // skill and silently lose the pending upstream SHA.
+  const state = await readState(statePath(stateDir));
+  const prev = state.skills[skill.name];
+
   const live = await readTree(dest);
   const marked = treeConflictMarkerPaths(live);
-  if (marked.length > 0) {
+  if (prev?.pendingSha !== undefined || marked.length > 0) {
+    const detail =
+      marked.length > 0
+        ? `markers in: ${marked.join(", ")}`
+        : `pending upstream ${prev?.pendingSha?.slice(0, 12) ?? ""}`;
     throw new UnresolvedConflictError(
-      `skill '${skill.name}' has unresolved conflict markers in: ${marked.join(", ")}. ` +
-        `Run 'skync resolve ${skill.name}' once you have edited the markers out, ` +
-        `or 'skync rollback ${skill.name}' to discard them.`,
+      `skill '${skill.name}' has an unresolved conflict (${detail}). ` +
+        `Run 'skync resolve ${skill.name}' once you have edited any markers out, ` +
+        `or 'skync rollback ${skill.name}' to discard it.`,
     );
   }
 
@@ -337,8 +356,6 @@ async function updateSkill(
   const ref = refOverride ?? remote.ref ?? "HEAD";
   const sha = await resolveRef(repoPath, ref);
 
-  const state = await readState(statePath(stateDir));
-  const prev = state.skills[skill.name];
   if (prev !== undefined && prev.sha === sha) {
     process.stdout.write(`${pc.bold(skill.name)} is up to date.\n`);
     return { name: skill.name, status: "up-to-date", conflicts: [] };
@@ -368,8 +385,12 @@ async function updateSkill(
     await swapDirAtomic(dest, staging);
 
     if (!result.clean) {
-      // Conflicts are now in dest. Leave base and state.json untouched so the
-      // merge base does not advance until the conflict is resolved.
+      // Conflicts are now in dest. Leave base untouched so the merge base does
+      // not advance, but stamp pendingSha in state so `resolve` knows which
+      // upstream commit the markers came from (the ref may move before then).
+      // state.json is the commit point: write it last.
+      markPending(state, skill.name, sha);
+      await writeState(statePath(stateDir), state);
       process.stdout.write(`${pc.bold(skill.name)} has conflicts; markers written to dest.\n`);
       return { name: skill.name, status: "conflict", conflicts: result.conflicts };
     }
@@ -489,6 +510,146 @@ async function runUpdate(name: string | undefined, options: UpdateOptions): Prom
   }
 }
 
+/**
+ * `skync resolve <name>`: mark a conflicted skill as resolved. Verifies dest no
+ * longer carries conflict markers, snapshots the resolved local copy, then
+ * re-materializes the pending upstream tree into base and advances state's
+ * `sha` to the pending upstream SHA. Idempotent: a skill with no pending
+ * conflict exits 0 with a no-op message. Note: non-text conflict kinds
+ * (binary, delete-modify, type-change) leave no marker in dest by design, so
+ * the marker check passes for them and resolving accepts whatever currently
+ * lives in dest (the "kept local" side) as the user's chosen resolution.
+ */
+async function runResolve(name: string): Promise<void> {
+  const home = homedir();
+  const projectPath = projectManifestPath();
+  const globalPath = globalManifestPath(home);
+
+  const [project, global] = await Promise.all([
+    loadManifestFile(projectPath),
+    loadManifestFile(globalPath),
+  ]);
+
+  const { targets, remotes } = resolveUpdateTargets(
+    project,
+    manifestBaseDir(projectPath),
+    projectStateDir(),
+    global,
+    manifestBaseDir(globalPath),
+    globalStateDir(home),
+    false,
+  );
+
+  const target = targets.find((t) => t.skill.name === name);
+  if (target === undefined) {
+    throw new ManifestValidationError(
+      `skill '${name}' is not in any manifest. ` +
+        `Restore the manifest entry, or run 'skync rollback ${name}' to discard a pending conflict.`,
+    );
+  }
+  const { skill, baseDir, stateDir } = target;
+
+  const state = await readState(statePath(stateDir));
+  const prev = state.skills[skill.name];
+  if (prev === undefined) {
+    throw new ManifestValidationError(
+      `skill '${skill.name}' has no recorded state; nothing to resolve.`,
+    );
+  }
+  const dest = expandDest(skill.dest, { home, baseDir });
+  // Finish any swap interrupted by an earlier crash before reading dest.
+  await recoverPendingSwap(dest);
+
+  // Refuse on stray markers BEFORE the pendingSha no-op branch: a corrupted
+  // state (pendingSha scrubbed by hand while markers remain in dest) must not
+  // get a reassuring 'nothing to resolve' message that masks live conflicts.
+  const live = await readTree(dest);
+  const marked = treeConflictMarkerPaths(live);
+  if (marked.length > 0) {
+    throw new UnresolvedConflictError(
+      `skill '${skill.name}' still has conflict markers in: ${marked.join(", ")}. ` +
+        `Edit them out and re-run 'skync resolve ${skill.name}'.`,
+    );
+  }
+
+  if (prev.pendingSha === undefined) {
+    process.stdout.write(
+      `${pc.bold(skill.name)} has no pending conflict; nothing to resolve.\n`,
+    );
+    return;
+  }
+  const pendingSha = prev.pendingSha;
+
+  // dest must exist: snapshotLocal copies from it, and a missing dest would
+  // bubble up an opaque ENOENT from copyDirAtomic. (readTree on a missing
+  // directory returns an empty Map, so we cannot rely on the marker scan to
+  // catch this — check explicitly.)
+  try {
+    await stat(dest);
+  } catch (err) {
+    if (isNotFound(err)) {
+      throw new UnresolvedConflictError(
+        `dest '${dest}' for skill '${skill.name}' does not exist; ` +
+          `restore it (e.g. from a backup under .skync/backups/${skill.name}/) ` +
+          `before re-running 'skync resolve ${skill.name}'.`,
+      );
+    }
+    throw err;
+  }
+
+  const remote = remotes[skill.remote];
+  if (remote === undefined) {
+    throw new ManifestValidationError(
+      `skill '${skill.name}' references unknown remote '${skill.remote}'`,
+    );
+  }
+
+  const repoPath = await ensureRemoteClone(cacheDir(stateDir), remote.repo);
+
+  // Pre-flight: confirm the pending commit still exists in the local cache.
+  // If it was force-pushed away and garbage-collected upstream, materializeSrc
+  // would fail mid-flight with an opaque git error; surface a clean one.
+  try {
+    await git(["cat-file", "-e", `${pendingSha}^{commit}`], { cwd: repoPath });
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new UnresolvedConflictError(
+      `the upstream commit recorded as pending (${pendingSha.slice(0, 12)}) ` +
+        `is no longer present in ${remote.repo} (possibly force-pushed). ` +
+        `Run 'skync rollback ${skill.name}' to discard the pending conflict, ` +
+        `then 'skync update ${skill.name}' against current upstream. ` +
+        `Underlying: ${detail}`,
+    );
+  }
+
+  // Materialize the pending upstream tree into a scratch dir for populateBase.
+  const upstreamDir = await mkdtemp(join(tmpdir(), "skync-upstream-"));
+  try {
+    await materializeSrc(repoPath, pendingSha, skill.src, upstreamDir);
+
+    // Snapshot the resolved local copy so the resolution is itself reversible.
+    // resolve does not mutate dest, but the snapshot mirrors update's habit
+    // and gives a later rollback a clean target.
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    await snapshotLocal(backupSnapshotDir(stateDir, skill.name, timestamp), dest);
+
+    // Advance base to the pending upstream tree (atomic via copyDirAtomic).
+    await populateBase(baseSkillDir(stateDir, skill.name), upstreamDir);
+
+    // state.json is the commit point: write last, clearing pendingSha. The
+    // operation is idempotent on crash recovery because pendingSha stays set
+    // until this write commits.
+    commitResolution(state, skill.name, pendingSha, new Date().toISOString());
+    await writeState(statePath(stateDir), state);
+
+    process.stdout.write(
+      `Resolved ${pc.bold(skill.name)} at ${pendingSha.slice(0, 12)}; base advanced.\n`,
+    );
+  } finally {
+    await rm(upstreamDir, { recursive: true, force: true });
+  }
+}
+
 function buildProgram(): Command {
   const program = new Command();
   program
@@ -525,6 +686,15 @@ function buildProgram(): Command {
     .option("--global", "update only globally tracked skills")
     .action(async (name: string | undefined, options: UpdateOptions) => {
       await runUpdate(name, options);
+    });
+
+  program
+    .command("resolve <name>")
+    .description(
+      "Mark a conflicted skill as resolved: verify no markers remain, snapshot, and advance base to the pending upstream commit.",
+    )
+    .action(async (name: string) => {
+      await runResolve(name);
     });
 
   return program;
