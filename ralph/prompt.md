@@ -42,7 +42,7 @@ git commit -m "issue/<id>: start work"
 
 The `git mv` + commit marks the issue as in-progress. Triage scans `.claude/worktree/*/issues/inprogress/` to discover active work.
 
-All subsequent steps (exploration, TDD, feedback loops, commit, issue-file move, push, PR) run inside `<worktree>`. Do NOT remove the worktree at the end — the user reviews the PR first and cleans up afterwards.
+All subsequent steps (exploration, TDD, feedback loops, commit, issue-file move, push, PR) run inside `<worktree>`. Do NOT remove the worktree before the PR is merged — the user reviews and may push follow-up fixes onto the branch. Cleanup happens after merge; see the CLEANUP step below.
 
 # EXPLORATION
 Use the built-in Explore subagent (or spawn parallel general-purpose subagents) to investigate the parts of the codebase relevant to the chosen task. Each must return only architectural facts and file pointers — not file contents.
@@ -113,6 +113,19 @@ gh pr create \
 
 Print the PR URL on success.
 
+# CLEANUP AFTER MERGE
+Only after the PR has actually been merged (verify with `gh pr view <number> --json state` → `MERGED`), clean up from the main repo root:
+
+```
+git worktree remove <worktree>
+git branch -d <branch>
+git fetch --prune
+```
+
+`git branch -d` refuses to delete an unmerged branch, which is the safety net: if the PR was closed without merging, the local branch stays so you do not lose work. Never use `-D` to force-delete unless the user explicitly asks. If the worktree has uncommitted scratch from manual fixes, ask the user before removing rather than passing `--force`.
+
+If the PR has not been merged, do not clean up. The worktree must stay in place through review so the user can re-run, amend, or push fixes onto the branch.
+
 # FINAL RULES
 - Work on a SINGLE task.
 - Discovery in subagents. Main thread orchestrates and implements.
@@ -120,4 +133,4 @@ Print the PR URL on success.
 - Sentence case in PR titles, bodies, and commits.
 - No em dashes or en dashes in any text written.
 - Do not add Claude Code co-authorship to commits.
-- Do not remove the worktree.
+- Do not remove the worktree until the PR is merged; then clean it up per the CLEANUP step.
