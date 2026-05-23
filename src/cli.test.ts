@@ -344,6 +344,37 @@ describe("skync update (CLI)", () => {
     }
   });
 
+  it("records pendingSha in state.json when a conflict is written, without advancing sha", async () => {
+    const fixture = await createFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-update-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const add = await runCli(
+        ["add", "demo", "--repo", fixture.url, "--src", "skills/demo", "--dest", "vendor/demo"],
+        work,
+        home,
+      );
+      expect(add.code).toBe(0);
+      const baseSha = await demoStateSha(work);
+
+      await writeFile(join(work, "vendor/demo/SKILL.md"), "demo local\n");
+      await commitToFixture(fixture.dir, { "skills/demo/SKILL.md": "demo upstream\n" }, "edit skill");
+      const res = await runCli(["update", "demo"], work, home);
+      expect(res.code).toBe(2);
+
+      // sha unchanged (base did not advance), pendingSha records the upstream
+      // commit whose tree produced the in-place markers.
+      const state = JSON.parse(await readFile(join(work, ".skync/state.json"), "utf8"));
+      expect(state.skills.demo.sha).toBe(baseSha);
+      expect(state.skills.demo.pendingSha).toMatch(/^[0-9a-f]{40}$/);
+      expect(state.skills.demo.pendingSha).not.toBe(baseSha);
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
   it("refuses to update a skill that still has unresolved markers, pointing to resolve/rollback", async () => {
     const fixture = await createFixtureRepo();
     const work = await mkdtemp(join(tmpdir(), "skync-update-"));
@@ -377,6 +408,247 @@ describe("skync update (CLI)", () => {
       expect(await readFile(join(work, "vendor/demo/SKILL.md"), "utf8")).toBe(conflicted);
     } finally {
       await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a second update when pendingSha is set even after markers are scrubbed", async () => {
+    // B2 regression: pendingSha, not the presence of marker triples, is the
+    // canonical "this skill is mid-conflict" flag. A user who strips markers by
+    // hand without running resolve must still be refused.
+    const fixture = await createFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-update-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const add = await runCli(
+        ["add", "demo", "--repo", fixture.url, "--src", "skills/demo", "--dest", "vendor/demo"],
+        work,
+        home,
+      );
+      expect(add.code).toBe(0);
+
+      await writeFile(join(work, "vendor/demo/SKILL.md"), "demo local\n");
+      await commitToFixture(fixture.dir, { "skills/demo/SKILL.md": "demo upstream\n" }, "edit skill");
+      expect((await runCli(["update", "demo"], work, home)).code).toBe(2);
+
+      // Hand-strip every marker without running resolve.
+      await writeFile(join(work, "vendor/demo/SKILL.md"), "scrubbed by hand\n");
+
+      const res = await runCli(["update", "demo"], work, home);
+      expect(res.code).toBe(1);
+      expect(res.stderr).toMatch(/unresolved conflict/i);
+      // The detail names the pending upstream prefix, not a marker path.
+      expect(res.stderr).toMatch(/pending upstream [0-9a-f]{12}/);
+      expect(res.stderr).toMatch(/resolve/i);
+      expect(res.stderr).toMatch(/rollback/i);
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * Shared setup for resolve tests: add the demo skill, produce an overlapping
+ * conflict via an update, and return the work/home/fixture handles plus the
+ * SHA recorded as pending. Caller owns cleanup.
+ */
+async function setupConflict(): Promise<{
+  fixture: { dir: string; url: string };
+  work: string;
+  home: string;
+  baseSha: string;
+  pendingSha: string;
+}> {
+  const fixture = await createFixtureRepo();
+  const work = await mkdtemp(join(tmpdir(), "skync-resolve-"));
+  const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+  const add = await runCli(
+    ["add", "demo", "--repo", fixture.url, "--src", "skills/demo", "--dest", "vendor/demo"],
+    work,
+    home,
+  );
+  if (add.code !== 0) throw new Error(`setup add failed: ${add.stderr}`);
+  const baseSha = await demoStateSha(work);
+
+  await writeFile(join(work, "vendor/demo/SKILL.md"), "demo local\n");
+  await commitToFixture(fixture.dir, { "skills/demo/SKILL.md": "demo upstream\n" }, "edit skill");
+  const upd = await runCli(["update", "demo"], work, home);
+  if (upd.code !== 2) throw new Error(`setup update expected exit 2, got ${upd.code}: ${upd.stderr}`);
+
+  const state = JSON.parse(await readFile(join(work, ".skync/state.json"), "utf8"));
+  return { fixture, work, home, baseSha, pendingSha: state.skills.demo.pendingSha as string };
+}
+
+describe("skync resolve (CLI)", () => {
+  it("errors when conflict markers remain in dest", async () => {
+    const { fixture, work, home } = await setupConflict();
+    try {
+      const res = await runCli(["resolve", "demo"], work, home);
+      expect(res.code).toBe(1);
+      expect(res.stderr).toMatch(/still has conflict markers/i);
+      expect(res.stderr).toContain("SKILL.md");
+      expect(res.stderr).not.toMatch(/at .*\(.*:\d+:\d+\)/);
+
+      // dest is untouched; state still records the pending SHA.
+      const state = JSON.parse(await readFile(join(work, ".skync/state.json"), "utf8"));
+      expect(state.skills.demo.pendingSha).toMatch(/^[0-9a-f]{40}$/);
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("snapshots, advances base, and updates state.json when markers are gone", async () => {
+    const { fixture, work, home, baseSha, pendingSha } = await setupConflict();
+    try {
+      // One snapshot from the conflicting update; resolve should add a second.
+      const snapsBefore = await readdir(join(work, ".skync/backups/demo"));
+      expect(snapsBefore.length).toBe(1);
+
+      // User edits the markers out. Content is the user's choice; resolve only
+      // verifies no markers remain, then accepts dest as-is.
+      await writeFile(join(work, "vendor/demo/SKILL.md"), "merged content\n");
+
+      const res = await runCli(["resolve", "demo"], work, home);
+      expect(res.code).toBe(0);
+      expect(res.stdout).toMatch(/resolved/i);
+      expect(res.stdout).toContain(pendingSha.slice(0, 12));
+
+      // Base advanced to the pending upstream tree.
+      expect(await readFile(join(work, ".skync/base/demo/SKILL.md"), "utf8")).toBe(
+        "demo upstream\n",
+      );
+
+      // state.sha moved to pendingSha; pendingSha cleared.
+      const state = JSON.parse(await readFile(join(work, ".skync/state.json"), "utf8"));
+      expect(state.skills.demo.sha).toBe(pendingSha);
+      expect(state.skills.demo.sha).not.toBe(baseSha);
+      expect(state.skills.demo.pendingSha).toBeUndefined();
+
+      // Resolution snapshot was taken.
+      const snapsAfter = await readdir(join(work, ".skync/backups/demo"));
+      expect(snapsAfter.length).toBe(2);
+
+      // dest preserves the user's resolution.
+      expect(await readFile(join(work, "vendor/demo/SKILL.md"), "utf8")).toBe("merged content\n");
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("makes a subsequent update against unchanged upstream report up-to-date", async () => {
+    const { fixture, work, home } = await setupConflict();
+    try {
+      await writeFile(join(work, "vendor/demo/SKILL.md"), "merged content\n");
+      expect((await runCli(["resolve", "demo"], work, home)).code).toBe(0);
+
+      const upd = await runCli(["update", "demo"], work, home);
+      expect(upd.code).toBe(0);
+      expect(upd.stdout).toMatch(/up to date/i);
+      // No re-introduced markers in dest.
+      const dest = await readFile(join(work, "vendor/demo/SKILL.md"), "utf8");
+      expect(dest).not.toContain("<<<<<<<");
+      expect(dest).toBe("merged content\n");
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("is an idempotent no-op on a skill with no pending conflict", async () => {
+    const fixture = await createFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-resolve-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const add = await runCli(
+        ["add", "demo", "--repo", fixture.url, "--src", "skills/demo", "--dest", "vendor/demo"],
+        work,
+        home,
+      );
+      expect(add.code).toBe(0);
+
+      const first = await runCli(["resolve", "demo"], work, home);
+      expect(first.code).toBe(0);
+      expect(first.stdout).toMatch(/no pending conflict/i);
+
+      // State is untouched.
+      const stateBefore = await readFile(join(work, ".skync/state.json"), "utf8");
+
+      // Second call also a no-op (and leaves state byte-for-byte identical).
+      const second = await runCli(["resolve", "demo"], work, home);
+      expect(second.code).toBe(0);
+      expect(second.stdout).toMatch(/no pending conflict/i);
+      expect(await readFile(join(work, ".skync/state.json"), "utf8")).toBe(stateBefore);
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("errors with a clean message when dest was deleted before resolve", async () => {
+    const { fixture, work, home } = await setupConflict();
+    try {
+      // User edited the markers out, then accidentally rm'd the whole dest.
+      await rm(join(work, "vendor/demo"), { recursive: true, force: true });
+
+      const res = await runCli(["resolve", "demo"], work, home);
+      expect(res.code).toBe(1);
+      expect(res.stderr).toMatch(/does not exist/i);
+      expect(res.stderr).toMatch(/backups/i);
+      expect(res.stderr).not.toMatch(/ENOENT/);
+      expect(res.stderr).not.toMatch(/at .*\(.*:\d+:\d+\)/);
+
+      // State still records the pending conflict; nothing was clobbered.
+      const state = JSON.parse(await readFile(join(work, ".skync/state.json"), "utf8"));
+      expect(state.skills.demo.pendingSha).toMatch(/^[0-9a-f]{40}$/);
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses on live markers even when pendingSha was scrubbed from state", async () => {
+    const { fixture, work, home } = await setupConflict();
+    try {
+      // Simulate a corrupted state.json: pendingSha hand-scrubbed while the
+      // text markers remain in dest. Resolve must not pretend everything is fine.
+      const statePath = join(work, ".skync/state.json");
+      const state = JSON.parse(await readFile(statePath, "utf8"));
+      delete state.skills.demo.pendingSha;
+      await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`);
+
+      const res = await runCli(["resolve", "demo"], work, home);
+      expect(res.code).toBe(1);
+      expect(res.stderr).toMatch(/still has conflict markers/i);
+      expect(res.stderr).toContain("SKILL.md");
+      // Must NOT print the misleading idempotent no-op message.
+      expect(res.stdout).not.toMatch(/no pending conflict/i);
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("errors with a clean message on an unknown skill name", async () => {
+    const work = await mkdtemp(join(tmpdir(), "skync-resolve-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const res = await runCli(["resolve", "ghost"], work, home);
+      expect(res.code).toBe(1);
+      expect(res.stderr).toMatch(/'ghost' is not in any manifest/i);
+      expect(res.stderr).toMatch(/rollback/i);
+      expect(res.stderr).not.toMatch(/at .*\(.*:\d+:\d+\)/);
+    } finally {
       await rm(work, { recursive: true, force: true });
       await rm(home, { recursive: true, force: true });
     }

@@ -12,6 +12,13 @@ export const STATE_VERSION = 1;
  * `remote`/`src`/`dest` deliberately mirror the manifest so state is
  * self-contained: a later sync can trust state.json even if the manifest entry
  * was hand-edited or removed. `sha`/`syncedAt` live only here.
+ *
+ * `pendingSha` is set when `update` produced a conflict: it records the
+ * upstream SHA whose tree the in-place markers came from, so `resolve` can
+ * advance base to exactly that SHA (not whatever the ref currently points at,
+ * which may have moved). Its presence is the canonical "this skill is
+ * mid-conflict" flag and outlives the markers themselves, because non-text
+ * conflicts (binary, delete-modify, type-change) leave no marker in dest.
  */
 export interface SkillState {
   remote: string;
@@ -19,6 +26,7 @@ export interface SkillState {
   dest: string;
   sha: string;
   syncedAt: string;
+  pendingSha?: string;
 }
 
 /** The whole state file: a version plus per-skill records keyed by skill name. */
@@ -60,21 +68,43 @@ function validateState(raw: unknown): SkyncState {
       if (!isPlainObject(value)) {
         throw new StateValidationError(`state for skill '${name}' must be an object`);
       }
-      const fields: Array<keyof SkillState> = ["remote", "src", "dest", "sha", "syncedAt"];
-      for (const field of fields) {
+      const required: Array<"remote" | "src" | "dest" | "sha" | "syncedAt"> = [
+        "remote",
+        "src",
+        "dest",
+        "sha",
+        "syncedAt",
+      ];
+      for (const field of required) {
         if (typeof value[field] !== "string" || (value[field] as string).length === 0) {
           throw new StateValidationError(
             `state for skill '${name}' is missing a '${field}' string`,
           );
         }
       }
-      skills[name] = {
+      const record: SkillState = {
         remote: value.remote as string,
         src: value.src as string,
         dest: value.dest as string,
         sha: value.sha as string,
         syncedAt: value.syncedAt as string,
       };
+      // Optional pendingSha: present only when a prior update left a conflict.
+      // Enforce the 40-char hex shape so a corrupted or hand-edited state.json
+      // cannot smuggle a leading-dash value (e.g. `--upload-pack=...`) into the
+      // positional argv of `git cat-file` / `git archive` and have git parse it
+      // as a flag. Sub-string injection via shell is already blocked by
+      // execFile (no shell), but git's own argv parsing treats `-`-prefixed
+      // tokens as options.
+      if (value.pendingSha !== undefined) {
+        if (typeof value.pendingSha !== "string" || !/^[0-9a-f]{40}$/.test(value.pendingSha)) {
+          throw new StateValidationError(
+            `state for skill '${name}' has an invalid 'pendingSha' (must be a 40-char hex SHA)`,
+          );
+        }
+        record.pendingSha = value.pendingSha;
+      }
+      skills[name] = record;
     }
   }
   return { version: raw.version, skills };
@@ -137,4 +167,44 @@ export async function snapshotLocal(snapshotDir: string, destDir: string): Promi
  */
 export async function restoreSnapshot(destDir: string, snapshotDir: string): Promise<void> {
   await copyDirAtomic(destDir, snapshotDir);
+}
+
+/**
+ * Stamp a skill's record with the upstream SHA whose merge produced an
+ * unresolved conflict. The skill must already be tracked: a conflict can only
+ * arise where base exists, which means a prior successful sync wrote state.
+ * Mutates the input state in place and returns it for chaining.
+ */
+export function markPending(state: SkyncState, name: string, pendingSha: string): SkyncState {
+  const skill = state.skills[name];
+  if (skill === undefined) {
+    throw new StateValidationError(
+      `cannot mark pending for unknown skill '${name}' (no prior sync recorded)`,
+    );
+  }
+  skill.pendingSha = pendingSha;
+  return state;
+}
+
+/**
+ * Commit a resolution: advance the skill's base pointer to the pending upstream
+ * SHA, update syncedAt, and clear `pendingSha`. The skill must already be
+ * tracked. Mutates the input state in place and returns it for chaining.
+ */
+export function commitResolution(
+  state: SkyncState,
+  name: string,
+  sha: string,
+  syncedAt: string,
+): SkyncState {
+  const skill = state.skills[name];
+  if (skill === undefined) {
+    throw new StateValidationError(
+      `cannot commit resolution for unknown skill '${name}' (no prior sync recorded)`,
+    );
+  }
+  skill.sha = sha;
+  skill.syncedAt = syncedAt;
+  delete skill.pendingSha;
+  return state;
 }

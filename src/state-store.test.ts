@@ -10,6 +10,8 @@ import {
   snapshotLocal,
   restoreSnapshot,
   emptyState,
+  markPending,
+  commitResolution,
   STATE_VERSION,
   StateValidationError,
   type SkyncState,
@@ -103,6 +105,86 @@ describe("state store", () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+
+  it("round-trips an optional pendingSha field on a skill", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "skync-state-"));
+    const path = join(dir, "state.json");
+    try {
+      const state = withSkill("demo");
+      state.skills.demo.pendingSha = "deadbeef".repeat(5);
+      await writeState(path, state);
+
+      // The serialized JSON contains the field so a later read picks it up.
+      const serialized = await readFile(path, "utf8");
+      expect(serialized).toContain("pendingSha");
+
+      const reloaded = await readState(path);
+      expect(reloaded.skills.demo.pendingSha).toBe("deadbeef".repeat(5));
+      expect(reloaded).toEqual(state);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("omits pendingSha from disk when it is unset", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "skync-state-"));
+    const path = join(dir, "state.json");
+    try {
+      await writeState(path, withSkill("demo"));
+      const serialized = await readFile(path, "utf8");
+      // JSON.stringify drops undefined; the key must not leak as null or "".
+      expect(serialized).not.toContain("pendingSha");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a pendingSha that is not a 40-char hex SHA (blocks argv injection)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "skync-state-"));
+    const path = join(dir, "state.json");
+    try {
+      // A leading-dash value would be parsed by git itself as a flag if passed
+      // as a positional argv (no shell needed). The validator must refuse it.
+      for (const bad of ["", "abc", "--upload-pack=cmd", "Z".repeat(40), "deadbeef".repeat(5) + "x"]) {
+        await writeFile(
+          path,
+          JSON.stringify({
+            version: STATE_VERSION,
+            skills: {
+              demo: {
+                remote: "r",
+                src: "s",
+                dest: "d",
+                sha: "abc",
+                syncedAt: "2026-05-21T00:00:00.000Z",
+                pendingSha: bad,
+              },
+            },
+          }),
+        );
+        await expect(readState(path)).rejects.toThrow(/pendingSha/);
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("markPending stamps the SHA on a tracked skill and refuses unknown ones", () => {
+    const state = withSkill("demo");
+    markPending(state, "demo", "feedface".repeat(5));
+    expect(state.skills.demo.pendingSha).toBe("feedface".repeat(5));
+    expect(() => markPending(state, "ghost", "x")).toThrow(StateValidationError);
+  });
+
+  it("commitResolution advances sha+syncedAt and clears pendingSha", () => {
+    const state = withSkill("demo");
+    state.skills.demo.pendingSha = "feedface".repeat(5);
+    commitResolution(state, "demo", "cafebabe".repeat(5), "2026-05-22T12:00:00.000Z");
+    expect(state.skills.demo.sha).toBe("cafebabe".repeat(5));
+    expect(state.skills.demo.syncedAt).toBe("2026-05-22T12:00:00.000Z");
+    expect(state.skills.demo.pendingSha).toBeUndefined();
+    expect(() => commitResolution(state, "ghost", "x", "y")).toThrow(StateValidationError);
   });
 
   it("snapshots and restores a dest tree round-trip, preserving the executable bit", async () => {
