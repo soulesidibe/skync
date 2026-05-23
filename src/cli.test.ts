@@ -27,13 +27,57 @@ const GIT_ENV = {
 
 /**
  * Create a small fixture git repo with a `skills/demo` subtree and return a
- * `file://` URL for it.
+ * `file://` URL for it. SKILL.md has no frontmatter, so discovery cannot match
+ * it; use this fixture to drive the zero-match branch of `add`.
  */
 async function createFixtureRepo(): Promise<{ dir: string; url: string }> {
   const dir = await mkdtemp(join(tmpdir(), "skync-fixture-"));
   await mkdir(join(dir, "skills", "demo"), { recursive: true });
   await writeFile(join(dir, "README.md"), "root\n");
   await writeFile(join(dir, "skills", "demo", "SKILL.md"), "demo v1\n");
+  await run("git", ["init", "-q", "-b", "main"], { cwd: dir, env: GIT_ENV });
+  await run("git", ["add", "-A"], { cwd: dir, env: GIT_ENV });
+  await run("git", ["commit", "-q", "-m", "init"], { cwd: dir, env: GIT_ENV });
+  return { dir, url: `file://${dir}` };
+}
+
+/**
+ * Like `createFixtureRepo`, but the demo SKILL.md carries the YAML frontmatter
+ * (`name: demo`) discovery requires, so `add` without `--src` can resolve it.
+ */
+async function createDiscoverableFixtureRepo(): Promise<{ dir: string; url: string }> {
+  const dir = await mkdtemp(join(tmpdir(), "skync-fixture-"));
+  await mkdir(join(dir, "skills", "demo"), { recursive: true });
+  await writeFile(join(dir, "README.md"), "root\n");
+  await writeFile(
+    join(dir, "skills", "demo", "SKILL.md"),
+    "---\nname: demo\n---\ndemo v1\n",
+  );
+  await run("git", ["init", "-q", "-b", "main"], { cwd: dir, env: GIT_ENV });
+  await run("git", ["add", "-A"], { cwd: dir, env: GIT_ENV });
+  await run("git", ["commit", "-q", "-m", "init"], { cwd: dir, env: GIT_ENV });
+  return { dir, url: `file://${dir}` };
+}
+
+/**
+ * Fixture with two folders that both satisfy discovery's intersection rule
+ * for `demo`. Discovery against it raises a multi-match error, which makes it
+ * useful for two cases: asserting that an explicit `--src` bypasses discovery
+ * entirely, and asserting the multi-match error surface of `add`.
+ */
+async function createMultiMatchFixtureRepo(): Promise<{ dir: string; url: string }> {
+  const dir = await mkdtemp(join(tmpdir(), "skync-fixture-"));
+  await mkdir(join(dir, "skills", "demo"), { recursive: true });
+  await mkdir(join(dir, "extras", "demo"), { recursive: true });
+  await writeFile(join(dir, "README.md"), "root\n");
+  await writeFile(
+    join(dir, "skills", "demo", "SKILL.md"),
+    "---\nname: demo\n---\nskills demo\n",
+  );
+  await writeFile(
+    join(dir, "extras", "demo", "SKILL.md"),
+    "---\nname: demo\n---\nextras demo\n",
+  );
   await run("git", ["init", "-q", "-b", "main"], { cwd: dir, env: GIT_ENV });
   await run("git", ["add", "-A"], { cwd: dir, env: GIT_ENV });
   await run("git", ["commit", "-q", "-m", "init"], { cwd: dir, env: GIT_ENV });
@@ -233,6 +277,128 @@ describe("skync add (CLI)", () => {
       expect(res.stdout).toMatch(/adopted/i);
       expect(res.stdout).toMatch(/kept existing/i);
       expect(res.stdout).toMatch(/baked into base/i);
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("discovers --src when omitted and freezes the discovered path", async () => {
+    const fixture = await createDiscoverableFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-add-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const res = await runCli(
+        ["add", "demo", "--repo", fixture.url, "--dest", "vendor/demo"],
+        work,
+        home,
+      );
+      expect(res.code).toBe(0);
+
+      // dest received the discovered subtree contents.
+      expect(await readFile(join(work, "vendor/demo/SKILL.md"), "utf8")).toBe(
+        "---\nname: demo\n---\ndemo v1\n",
+      );
+      // base mirrors the synced upstream.
+      expect(await readFile(join(work, ".skync/base/demo/SKILL.md"), "utf8")).toBe(
+        "---\nname: demo\n---\ndemo v1\n",
+      );
+
+      // manifest and state record the discovered path verbatim.
+      const manifest = await readFile(join(work, "skync.yaml"), "utf8");
+      expect(manifest).toContain("src: skills/demo");
+      const state = JSON.parse(await readFile(join(work, ".skync/state.json"), "utf8"));
+      expect(state.skills.demo.src).toBe("skills/demo");
+      expect(state.skills.demo.sha).toMatch(/^[0-9a-f]{40}$/);
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("uses an explicit --src verbatim and skips discovery (multi-match fixture)", async () => {
+    const fixture = await createMultiMatchFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-add-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      // Discovery against this fixture would raise multi-match. If the explicit
+      // --src is honored without calling discovery, this still succeeds.
+      const res = await runCli(
+        [
+          "add",
+          "demo",
+          "--repo",
+          fixture.url,
+          "--src",
+          "extras/demo",
+          "--dest",
+          "vendor/demo",
+        ],
+        work,
+        home,
+      );
+      expect(res.code).toBe(0);
+
+      // dest comes from the explicit path, not the alternative.
+      expect(await readFile(join(work, "vendor/demo/SKILL.md"), "utf8")).toBe(
+        "---\nname: demo\n---\nextras demo\n",
+      );
+      const state = JSON.parse(await readFile(join(work, ".skync/state.json"), "utf8"));
+      expect(state.skills.demo.src).toBe("extras/demo");
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("exits 1 with a no-match message when --src is omitted and discovery finds nothing", async () => {
+    const fixture = await createFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-add-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const res = await runCli(
+        ["add", "demo", "--repo", fixture.url, "--dest", "vendor/demo"],
+        work,
+        home,
+      );
+      expect(res.code).toBe(1);
+      expect(res.stderr).toMatch(/no skill named 'demo' found in/);
+      expect(res.stderr).toContain(fixture.url);
+      expect(res.stderr).toMatch(/at [0-9a-f]{7}/);
+
+      // nothing should have been written.
+      await expect(readFile(join(work, "skync.yaml"), "utf8")).rejects.toThrow();
+      await expect(readFile(join(work, ".skync/state.json"), "utf8")).rejects.toThrow();
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("exits 1 with candidate list when --src is omitted and discovery finds multiple matches", async () => {
+    const fixture = await createMultiMatchFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-add-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const res = await runCli(
+        ["add", "demo", "--repo", fixture.url, "--dest", "vendor/demo"],
+        work,
+        home,
+      );
+      expect(res.code).toBe(1);
+      expect(res.stderr).toMatch(/multiple skill folders match 'demo'/);
+      expect(res.stderr).toContain(fixture.url);
+      expect(res.stderr).toMatch(/at [0-9a-f]{7}/);
+      expect(res.stderr).toContain("  extras/demo\n");
+      expect(res.stderr).toContain("  skills/demo\n");
+      expect(res.stderr).toMatch(/re-run with skync add --src/);
+
+      // nothing should have been written.
+      await expect(readFile(join(work, "skync.yaml"), "utf8")).rejects.toThrow();
     } finally {
       await rm(fixture.dir, { recursive: true, force: true });
       await rm(work, { recursive: true, force: true });
