@@ -2,9 +2,10 @@ import { describe, it, expect, beforeAll } from "vitest";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { statSync } from "node:fs";
-import { mkdtemp, mkdir, writeFile, readFile, readdir, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, readFile, readdir, rm, lstat } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
-import { join, resolve, dirname } from "node:path";
+import { basename, join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const run = promisify(execFile);
@@ -648,6 +649,407 @@ describe("skync resolve (CLI)", () => {
       expect(res.stderr).toMatch(/rollback/i);
       expect(res.stderr).not.toMatch(/at .*\(.*:\d+:\d+\)/);
     } finally {
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * Recursively hash a directory tree into a `posix-path -> "mode:sha256"` record
+ * so a test can assert deep equality across two snapshots. Missing roots return
+ * a sentinel so the absence itself is captured. Walks files and symlinks; empty
+ * dirs are not recorded (matches readTree semantics).
+ */
+async function snapshotTree(root: string): Promise<Record<string, string>> {
+  const out: Record<string, string> = {};
+  async function walk(dir: string, rel: string): Promise<void> {
+    let entries;
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+        if (rel === "") out["__missing__"] = "1";
+        return;
+      }
+      throw err;
+    }
+    for (const entry of entries) {
+      const full = join(dir, entry.name);
+      const key = rel === "" ? entry.name : `${rel}/${entry.name}`;
+      if (entry.isDirectory()) {
+        await walk(full, key);
+        continue;
+      }
+      const info = await lstat(full);
+      if (entry.isSymbolicLink()) {
+        const target = await readFile(full).catch(() => Buffer.from(""));
+        out[key] = `symlink:${(info.mode & 0o777).toString(8)}:${createHash("sha256").update(target).digest("hex")}`;
+        continue;
+      }
+      const bytes = await readFile(full);
+      out[key] = `file:${(info.mode & 0o777).toString(8)}:${createHash("sha256").update(bytes).digest("hex")}`;
+    }
+  }
+  await walk(root, "");
+  return out;
+}
+
+async function snapshotFile(path: string): Promise<string> {
+  try {
+    const bytes = await readFile(path);
+    return createHash("sha256").update(bytes).digest("hex");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return "__missing__";
+    throw err;
+  }
+}
+
+async function siblingsMatching(parent: string, pattern: RegExp): Promise<string[]> {
+  let entries;
+  try {
+    entries = await readdir(parent);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw err;
+  }
+  return entries.filter((name) => pattern.test(name)).sort();
+}
+
+describe("skync check (CLI)", () => {
+  it("exits 0 with an empty-state message when no skills are tracked", async () => {
+    const work = await mkdtemp(join(tmpdir(), "skync-check-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const res = await runCli(["check"], work, home);
+      expect(res.code).toBe(0);
+      expect(res.stdout).toMatch(/no tracked skills/i);
+    } finally {
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("exits 0 and reports up-to-date when nothing has moved", async () => {
+    const fixture = await createFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-check-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const add = await runCli(
+        ["add", "demo", "--repo", fixture.url, "--src", "skills/demo", "--dest", "vendor/demo"],
+        work,
+        home,
+      );
+      expect(add.code).toBe(0);
+
+      const res = await runCli(["check"], work, home);
+      expect(res.code).toBe(0);
+      expect(res.stdout).toContain("[up-to-date]");
+      expect(res.stdout).toContain("demo");
+      // Summary line leads with the exit code.
+      expect(res.stdout).toMatch(/exit 0/);
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("exits 1 and reports a clean update when upstream advances without local overlap", async () => {
+    const fixture = await createFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-check-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const add = await runCli(
+        ["add", "demo", "--repo", fixture.url, "--src", "skills/demo", "--dest", "vendor/demo"],
+        work,
+        home,
+      );
+      expect(add.code).toBe(0);
+
+      // Upstream adds a new file. No local edits.
+      await commitToFixture(fixture.dir, { "skills/demo/EXTRA.md": "extra\n" }, "add extra");
+
+      const res = await runCli(["check"], work, home);
+      expect(res.code).toBe(1);
+      expect(res.stdout).toContain("[clean-update]");
+      expect(res.stdout).toContain("demo");
+      // Short SHA appears on the line.
+      expect(res.stdout).toMatch(/[0-9a-f]{12}/);
+      expect(res.stdout).toMatch(/exit 1/);
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("exits 2 when an upstream change would conflict with a local edit", async () => {
+    const fixture = await createFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-check-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const add = await runCli(
+        ["add", "demo", "--repo", fixture.url, "--src", "skills/demo", "--dest", "vendor/demo"],
+        work,
+        home,
+      );
+      expect(add.code).toBe(0);
+
+      // Both sides change the same line differently.
+      await writeFile(join(work, "vendor/demo/SKILL.md"), "demo local\n");
+      await commitToFixture(fixture.dir, { "skills/demo/SKILL.md": "demo upstream\n" }, "edit skill");
+
+      const res = await runCli(["check"], work, home);
+      expect(res.code).toBe(2);
+      expect(res.stdout).toContain("[would-conflict]");
+      expect(res.stdout).toContain("SKILL.md");
+      expect(res.stdout).toMatch(/exit 2/);
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("aggregates: a clean update plus an up-to-date skill exits 1", async () => {
+    const fixtureA = await createFixtureRepo();
+    const fixtureB = await createFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-check-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const a = await runCli(
+        ["add", "alpha", "--repo", fixtureA.url, "--src", "skills/demo", "--dest", "vendor/alpha"],
+        work,
+        home,
+      );
+      expect(a.code).toBe(0);
+      const b = await runCli(
+        ["add", "bravo", "--repo", fixtureB.url, "--src", "skills/demo", "--dest", "vendor/bravo"],
+        work,
+        home,
+      );
+      expect(b.code).toBe(0);
+
+      // Only fixtureA advances.
+      await commitToFixture(fixtureA.dir, { "skills/demo/EXTRA.md": "x\n" }, "extra");
+
+      const res = await runCli(["check"], work, home);
+      expect(res.code).toBe(1);
+      expect(res.stdout).toContain("[clean-update]");
+      expect(res.stdout).toContain("[up-to-date]");
+    } finally {
+      await rm(fixtureA.dir, { recursive: true, force: true });
+      await rm(fixtureB.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("aggregates: a clean update plus a would-conflict skill exits 2 (worst wins)", async () => {
+    const fixtureA = await createFixtureRepo();
+    const fixtureB = await createFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-check-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const a = await runCli(
+        ["add", "alpha", "--repo", fixtureA.url, "--src", "skills/demo", "--dest", "vendor/alpha"],
+        work,
+        home,
+      );
+      expect(a.code).toBe(0);
+      const b = await runCli(
+        ["add", "bravo", "--repo", fixtureB.url, "--src", "skills/demo", "--dest", "vendor/bravo"],
+        work,
+        home,
+      );
+      expect(b.code).toBe(0);
+
+      // alpha: clean upstream-only change.
+      await commitToFixture(fixtureA.dir, { "skills/demo/EXTRA.md": "x\n" }, "extra");
+      // bravo: overlapping change vs local edit.
+      await writeFile(join(work, "vendor/bravo/SKILL.md"), "bravo local\n");
+      await commitToFixture(fixtureB.dir, { "skills/demo/SKILL.md": "bravo upstream\n" }, "edit");
+
+      const res = await runCli(["check"], work, home);
+      expect(res.code).toBe(2);
+      expect(res.stdout).toContain("[clean-update]");
+      expect(res.stdout).toContain("[would-conflict]");
+    } finally {
+      await rm(fixtureA.dir, { recursive: true, force: true });
+      await rm(fixtureB.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("reports pending-conflict (exit 2) and skips fetch when dest already has markers", async () => {
+    const fixture = await createFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-check-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const add = await runCli(
+        ["add", "demo", "--repo", fixture.url, "--src", "skills/demo", "--dest", "vendor/demo"],
+        work,
+        home,
+      );
+      expect(add.code).toBe(0);
+
+      // Stamp in unresolved markers.
+      await writeFile(
+        join(work, "vendor/demo/SKILL.md"),
+        "<<<<<<< local\nmine\n=======\ntheirs\n>>>>>>> upstream\n",
+      );
+
+      // Move upstream too. If check fetched, it would see the new commit; the
+      // pending-conflict branch must short-circuit before fetching, so we cannot
+      // assert "no fetch occurred" directly across processes. We can at least
+      // assert classification and exit code; the short-circuit is also covered
+      // by the read-only invariant test below (no work in dest/state).
+      await commitToFixture(fixture.dir, { "skills/demo/EXTRA.md": "x\n" }, "extra");
+
+      const res = await runCli(["check"], work, home);
+      expect(res.code).toBe(2);
+      expect(res.stdout).toContain("[pending-conflict]");
+      expect(res.stdout).toMatch(/resolve/i);
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("exits 3 on an invalid manifest (unknown remote reference)", async () => {
+    const work = await mkdtemp(join(tmpdir(), "skync-check-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      await writeFile(
+        join(work, "skync.yaml"),
+        `skills:\n  - name: a\n    remote: ghost\n    src: x\n    dest: y\n`,
+      );
+      const res = await runCli(["check"], work, home);
+      expect(res.code).toBe(3);
+      expect(res.stderr).toMatch(/unknown remote 'ghost'/);
+    } finally {
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("exits 3 when a manifest skill has no state entry", async () => {
+    const fixture = await createFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-check-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const add = await runCli(
+        ["add", "demo", "--repo", fixture.url, "--src", "skills/demo", "--dest", "vendor/demo"],
+        work,
+        home,
+      );
+      expect(add.code).toBe(0);
+
+      // Remove the state entry to simulate a manifest-only skill.
+      const statePath = join(work, ".skync/state.json");
+      const state = JSON.parse(await readFile(statePath, "utf8"));
+      delete state.skills.demo;
+      await writeFile(statePath, JSON.stringify(state, null, 2));
+
+      const res = await runCli(["check"], work, home);
+      expect(res.code).toBe(3);
+      expect(res.stderr).toMatch(/skync add/);
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("exits 3 when a .skync-old sidecar from an interrupted swap is present", async () => {
+    const fixture = await createFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-check-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const add = await runCli(
+        ["add", "demo", "--repo", fixture.url, "--src", "skills/demo", "--dest", "vendor/demo"],
+        work,
+        home,
+      );
+      expect(add.code).toBe(0);
+
+      // Simulate an interrupted atomic swap: leave the deterministic sidecar.
+      await mkdir(join(work, "vendor/demo.skync-old"), { recursive: true });
+      await writeFile(join(work, "vendor/demo.skync-old/SKILL.md"), "interrupted\n");
+
+      const res = await runCli(["check"], work, home);
+      expect(res.code).toBe(3);
+      expect(res.stderr).toMatch(/skync update/);
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("exits 3 when the positional skill name does not match a tracked skill", async () => {
+    const fixture = await createFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-check-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const add = await runCli(
+        ["add", "demo", "--repo", fixture.url, "--src", "skills/demo", "--dest", "vendor/demo"],
+        work,
+        home,
+      );
+      expect(add.code).toBe(0);
+
+      const res = await runCli(["check", "ghost"], work, home);
+      expect(res.code).toBe(3);
+      expect(res.stderr).toMatch(/ghost/);
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("modifies no user-visible state (read-only invariant)", async () => {
+    const fixture = await createFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-check-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const add = await runCli(
+        ["add", "demo", "--repo", fixture.url, "--src", "skills/demo", "--dest", "vendor/demo"],
+        work,
+        home,
+      );
+      expect(add.code).toBe(0);
+
+      // Move upstream so check has real work to do (resolve + materialize +
+      // dry-run merge), exercising the full path while still being read-only.
+      await commitToFixture(fixture.dir, { "skills/demo/EXTRA.md": "extra\n" }, "extra");
+
+      const destSnap0 = await snapshotTree(join(work, "vendor/demo"));
+      const baseSnap0 = await snapshotTree(join(work, ".skync/base/demo"));
+      const stateSnap0 = await snapshotFile(join(work, ".skync/state.json"));
+      const projManifest0 = await snapshotFile(join(work, "skync.yaml"));
+      const globalManifest0 = await snapshotFile(join(home, ".config/skync/manifest.yaml"));
+
+      const res = await runCli(["check"], work, home);
+      expect(res.code).toBe(1);
+
+      expect(await snapshotTree(join(work, "vendor/demo"))).toEqual(destSnap0);
+      expect(await snapshotTree(join(work, ".skync/base/demo"))).toEqual(baseSnap0);
+      expect(await snapshotFile(join(work, ".skync/state.json"))).toBe(stateSnap0);
+      expect(await snapshotFile(join(work, "skync.yaml"))).toBe(projManifest0);
+      expect(await snapshotFile(join(home, ".config/skync/manifest.yaml"))).toBe(globalManifest0);
+
+      // No leftover staging or sidecar dirs next to dest.
+      const siblings = await siblingsMatching(join(work, "vendor"), /^demo\.(skync-staging|skync-old)/);
+      expect(siblings).toEqual([]);
+      // And the dest directory name (basename) is unchanged.
+      expect(basename(join(work, "vendor/demo"))).toBe("demo");
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
       await rm(work, { recursive: true, force: true });
       await rm(home, { recursive: true, force: true });
     }

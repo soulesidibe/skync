@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { homedir, tmpdir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import { readdir, stat, mkdtemp, rm } from "node:fs/promises";
 import { Command } from "commander";
 import pc from "picocolors";
@@ -42,6 +42,7 @@ import {
   swapDirAtomic,
   recoverPendingSwap,
   stagingPathFor,
+  OLD_DIR_SUFFIX,
 } from "./atomic.js";
 import { readTree, writeTree } from "./tree-io.js";
 import { mergeTrees, type Conflict } from "./treemerge.js";
@@ -54,6 +55,19 @@ import { treeConflictMarkerPaths } from "./conflict-markers.js";
  * errors (distinct from the exit-2 "completed with conflicts" outcome).
  */
 class UnresolvedConflictError extends Error {}
+
+/**
+ * Operational error raised inside `runCheck` (manifest invalid, fetch failed,
+ * missing state entry, pending swap sidecar, etc.). A named subclass, not a
+ * duck-typed `.exitCode` property, so the global handler can map it to exit 3
+ * without affecting other commands that might re-throw an inner error.
+ */
+class CheckOperationalError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CheckOperationalError";
+  }
+}
 
 /** Outcome of updating one skill, aggregated by runUpdate for reporting. */
 interface UpdateOutcome {
@@ -583,7 +597,7 @@ async function runResolve(name: string): Promise<void> {
   // dest must exist: snapshotLocal copies from it, and a missing dest would
   // bubble up an opaque ENOENT from copyDirAtomic. (readTree on a missing
   // directory returns an empty Map, so we cannot rely on the marker scan to
-  // catch this — check explicitly.)
+  // catch this. Check explicitly.)
   try {
     await stat(dest);
   } catch (err) {
@@ -650,6 +664,245 @@ async function runResolve(name: string): Promise<void> {
   }
 }
 
+interface CheckOptions {
+  global?: boolean;
+}
+
+/** Per-skill classification produced by the dry-run check. */
+type CheckStatus =
+  | "up-to-date"
+  | "clean-update"
+  | "would-conflict"
+  | "pending-conflict";
+
+interface CheckOutcome {
+  name: string;
+  status: CheckStatus;
+  sha?: string;
+  conflictPaths?: string[];
+}
+
+/**
+ * Detect leftover artifacts from an interrupted atomic swap next to `dest`.
+ * `<dest>.skync-old` is the deterministic sidecar `swapDirAtomic` writes; any
+ * `${basename}.skync-staging-*` sibling is a stale staging tree from a process
+ * that exited before it could swap. Either signals that an `update` must run
+ * first to recover; `check` refuses to read in that state.
+ */
+async function pendingSwapArtifact(dest: string): Promise<string | null> {
+  const parent = dirname(dest);
+  const name = basename(dest);
+  const old = join(parent, `${name}${OLD_DIR_SUFFIX}`);
+  try {
+    await stat(old);
+    return old;
+  } catch (err) {
+    if (!isNotFound(err)) throw err;
+  }
+  let entries;
+  try {
+    entries = await readdir(parent);
+  } catch (err) {
+    if (isNotFound(err)) return null;
+    throw err;
+  }
+  const stagingPrefix = `${name}.skync-staging-`;
+  const stale = entries.find((entry) => entry.startsWith(stagingPrefix));
+  return stale === undefined ? null : join(parent, stale);
+}
+
+/**
+ * Classify one skill via an in-memory dry-run merge, without writing anything
+ * to user-visible state. Order is deliberate: marker check before fetch, so a
+ * pending-conflict skill short-circuits before touching the network or disk.
+ */
+async function checkSkill(
+  target: UpdateTarget,
+  remotes: Manifest["remotes"],
+  home: string,
+): Promise<CheckOutcome> {
+  const { skill, baseDir, stateDir } = target;
+  const remote = remotes[skill.remote];
+  if (remote === undefined) {
+    throw new CheckOperationalError(
+      `skill '${skill.name}' references unknown remote '${skill.remote}'`,
+    );
+  }
+
+  const dest = expandDest(skill.dest, { home, baseDir });
+
+  // Pending atomic-swap sidecar or staging dir means the last update did not
+  // complete. `check` must not call recoverPendingSwap (that writes); refuse
+  // with an operational error so the operator runs `skync update` to recover.
+  const stale = await pendingSwapArtifact(dest);
+  if (stale !== null) {
+    throw new CheckOperationalError(
+      `skill '${skill.name}' has a pending atomic-swap artifact at ${stale}. ` +
+        `Run 'skync update' to recover, or remove it manually if you know it is safe.`,
+    );
+  }
+
+  // Live tree first so pre-existing conflict markers short-circuit before any
+  // network work. Pending-conflict and would-conflict share exit 2 but are
+  // distinct lines in the per-skill report.
+  const live = await readTree(dest);
+  const marked = treeConflictMarkerPaths(live);
+  if (marked.length > 0) {
+    return {
+      name: skill.name,
+      status: "pending-conflict",
+      conflictPaths: marked,
+    };
+  }
+
+  const state = await readState(statePath(stateDir));
+  const prev = state.skills[skill.name];
+  if (prev === undefined) {
+    throw new CheckOperationalError(
+      `skill '${skill.name}' is in the manifest but has no state entry. Run 'skync add' to initialize it.`,
+    );
+  }
+
+  const repoPath = await ensureRemoteClone(cacheDir(stateDir), remote.repo);
+  const ref = remote.ref ?? "HEAD";
+  const sha = await resolveRef(repoPath, ref);
+
+  if (sha === prev.sha) {
+    return { name: skill.name, status: "up-to-date", sha };
+  }
+
+  const upstreamDir = await mkdtemp(join(tmpdir(), "skync-check-"));
+  try {
+    await materializeSrc(repoPath, sha, skill.src, upstreamDir);
+    const [base, upstream] = await Promise.all([
+      readTree(baseSkillDir(stateDir, skill.name)),
+      readTree(upstreamDir),
+    ]);
+    const result = mergeTrees(base, upstream, live);
+    if (result.clean) {
+      return { name: skill.name, status: "clean-update", sha };
+    }
+    return {
+      name: skill.name,
+      status: "would-conflict",
+      sha,
+      conflictPaths: result.conflicts.map((c) => c.path).sort(),
+    };
+  } finally {
+    await rm(upstreamDir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Format one outcome as a stable, greppable line. Glyphs and colors are
+ * decoration; the `[status]` token is the contract a scheduler script reads.
+ */
+function formatCheckLine(o: CheckOutcome): string {
+  const shortSha = o.sha === undefined ? "" : ` ${o.sha.slice(0, 12)}`;
+  switch (o.status) {
+    case "up-to-date":
+      return `${pc.green("✓")} ${pc.bold(o.name)} [up-to-date]${shortSha}`;
+    case "clean-update":
+      return `${pc.cyan("↑")} ${pc.bold(o.name)} [clean-update]${shortSha}`;
+    case "would-conflict": {
+      const paths = (o.conflictPaths ?? []).join(", ");
+      return `${pc.yellow("!")} ${pc.bold(o.name)} [would-conflict]${shortSha} on ${paths}`;
+    }
+    case "pending-conflict": {
+      const paths = (o.conflictPaths ?? []).join(", ");
+      return `${pc.red("!!")} ${pc.bold(o.name)} [pending-conflict] on ${paths} (run 'skync resolve' or 'skync rollback' first)`;
+    }
+  }
+}
+
+/**
+ * `skync check [name]`: read-only dry-run merge per skill, with distinct
+ * exit codes so a scheduler can branch on the outcome. Writes nothing to
+ * dest, base, state, or manifests; only `git fetch` into the remote cache and
+ * a mkdtemp scratch dir for upstream materialization (cleaned in finally).
+ *
+ * Exit codes:
+ *   0 all skills up to date
+ *   1 at least one clean update available, no conflicts anywhere
+ *   2 at least one would-conflict or pending-conflict
+ *   3 operational error (manifest invalid, fetch failed, missing state entry,
+ *     pending swap sidecar, unknown name filter, or any unanticipated throw)
+ *
+ * All throws inside the body are wrapped in CheckOperationalError so the global
+ * catch maps them to exit 3, never exit 1 or exit 2.
+ */
+async function runCheck(name: string | undefined, options: CheckOptions): Promise<void> {
+  try {
+    const home = homedir();
+    const projectPath = projectManifestPath();
+    const globalPath = globalManifestPath(home);
+
+    const [project, global] = await Promise.all([
+      loadManifestFile(projectPath),
+      loadManifestFile(globalPath),
+    ]);
+
+    const { targets, remotes } = resolveUpdateTargets(
+      project,
+      manifestBaseDir(projectPath),
+      projectStateDir(),
+      global,
+      manifestBaseDir(globalPath),
+      globalStateDir(home),
+      options.global === true,
+    );
+
+    let selected = targets;
+    if (name !== undefined) {
+      selected = targets.filter((t) => t.skill.name === name);
+      if (selected.length === 0) {
+        throw new CheckOperationalError(`no tracked skill named '${name}'`);
+      }
+    }
+
+    if (selected.length === 0) {
+      process.stdout.write("No tracked skills to check.\n");
+      return;
+    }
+
+    const outcomes: CheckOutcome[] = [];
+    for (const target of selected) {
+      outcomes.push(await checkSkill(target, remotes, home));
+    }
+
+    for (const outcome of outcomes) {
+      process.stdout.write(`${formatCheckLine(outcome)}\n`);
+    }
+
+    const counts = {
+      upToDate: outcomes.filter((o) => o.status === "up-to-date").length,
+      cleanUpdate: outcomes.filter((o) => o.status === "clean-update").length,
+      wouldConflict: outcomes.filter((o) => o.status === "would-conflict").length,
+      pending: outcomes.filter((o) => o.status === "pending-conflict").length,
+    };
+    const conflictGroup = counts.wouldConflict + counts.pending;
+    const exitCode = conflictGroup > 0 ? 2 : counts.cleanUpdate > 0 ? 1 : 0;
+
+    // Worst-first summary so a human reading cron mail sees the failure mode
+    // before the green skills.
+    const parts: string[] = [];
+    if (counts.wouldConflict > 0) parts.push(`${counts.wouldConflict} would-conflict`);
+    if (counts.pending > 0) parts.push(`${counts.pending} pending-conflict`);
+    if (counts.cleanUpdate > 0) parts.push(`${counts.cleanUpdate} clean-update`);
+    if (counts.upToDate > 0) parts.push(`${counts.upToDate} up-to-date`);
+    process.stdout.write(`\nexit ${exitCode}: ${parts.join(", ")}\n`);
+
+    process.exitCode = exitCode;
+  } catch (err) {
+    if (err instanceof CheckOperationalError) throw err;
+    // Wrap any other throw (ManifestValidationError, RemoteCacheError,
+    // GitError, fs errors, programming errors) so the global handler still
+    // returns exit 3 for `check`, never exit 1 or exit 2.
+    const message = err instanceof Error ? err.message : String(err);
+    throw new CheckOperationalError(message);
+  }
+}
+
 function buildProgram(): Command {
   const program = new Command();
   program
@@ -697,6 +950,16 @@ function buildProgram(): Command {
       await runResolve(name);
     });
 
+  program
+    .command("check [name]")
+    .description(
+      "Dry-run merge per skill; reports up-to-date / clean-update / would-conflict and exits with a distinct code for each.",
+    )
+    .option("--global", "check only globally tracked skills")
+    .action(async (name: string | undefined, options: CheckOptions) => {
+      await runCheck(name, options);
+    });
+
   return program;
 }
 
@@ -705,14 +968,14 @@ async function main(): Promise<void> {
   await program.parseAsync(process.argv);
 }
 
-// Exit codes: 0 success, 2 completed-with-conflicts (set in runUpdate), 1
-// validation/operational error; richer codes (e.g. for check) arrive in a later
-// issue. Every error class (ManifestValidationError, RemoteCacheError,
-// StateValidationError, GitError, UnresolvedConflictError) is a plain Error, so
-// a single handler prints its message (never a stack trace) and sets exit 1. A
-// thrown error takes precedence over an exit-2 conflict in the same run.
+// Exit codes: 0 success; 2 completed-with-conflicts (set in runUpdate, or
+// `would-conflict`/`pending-conflict` in runCheck); 1 validation/operational
+// error for most commands; 3 operational error from `check` so a scheduler can
+// distinguish it from the would-conflict signal it acts on. Errors carry a
+// human-readable message only (never a stack trace). CheckOperationalError is
+// the only error class routed to exit 3; everything else stays at exit 1.
 main().catch((err: unknown) => {
   const message = err instanceof Error ? err.message : String(err);
   process.stderr.write(`${pc.red("error")}: ${message}\n`);
-  process.exitCode = 1;
+  process.exitCode = err instanceof CheckOperationalError ? 3 : 1;
 });
