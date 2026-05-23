@@ -25,6 +25,7 @@ import {
   globalStateDir,
   cacheDir,
   baseSkillDir,
+  backupsDir,
   backupSnapshotDir,
   statePath,
 } from "./paths.js";
@@ -33,9 +34,14 @@ import {
   readState,
   writeState,
   populateBase,
-  snapshotLocal,
+  takeSnapshot,
+  restoreSnapshot,
+  listSnapshots,
+  pruneSnapshots,
   markPending,
   commitResolution,
+  SNAPSHOT_TIMESTAMP_RE,
+  type SkillState,
 } from "./state-store.js";
 import { git } from "./git.js";
 import {
@@ -274,6 +280,52 @@ async function runAdd(name: string, options: AddOptions): Promise<void> {
 interface UpdateOptions {
   ref?: string;
   global?: boolean;
+  keep: number;
+}
+
+/** Default number of backup snapshots retained per skill. */
+export const DEFAULT_KEEP = 10;
+
+/**
+ * Parse a `--keep <n>` argument. Must be a positive integer; anything else is
+ * a user error caught up front rather than producing an opaque later failure
+ * (pruneSnapshots itself also refuses, but a Commander-time error is friendlier).
+ */
+function parseKeep(raw: string): number {
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isInteger(n) || n < 1 || String(n) !== raw.trim()) {
+    throw new ManifestValidationError(`--keep must be a positive integer (got '${raw}')`);
+  }
+  return n;
+}
+
+/** Filesystem-safe timestamp matching the SNAPSHOT_TIMESTAMP_RE in state-store. */
+function nowSnapshotTimestamp(): string {
+  return new Date().toISOString().replace(/[:.]/g, "-");
+}
+
+/**
+ * Prune older snapshots for one skill after a successful state mutation,
+ * preserving the snapshot a pending conflict depends on (if any). Best-effort:
+ * a prune failure must not turn a successful update or resolve into an error,
+ * so a warning is printed and the exit code stays at the operation's outcome.
+ */
+async function pruneAfterMutation(
+  stateDir: string,
+  skillName: string,
+  current: SkillState | undefined,
+  keep: number,
+): Promise<void> {
+  const dir = backupsDir(stateDir, skillName);
+  const protectedTimestamps = current?.pendingSnapshotTs !== undefined ? [current.pendingSnapshotTs] : [];
+  try {
+    await pruneSnapshots(dir, keep, protectedTimestamps);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    process.stderr.write(
+      `${pc.yellow("warning")}: could not prune backups for ${skillName}: ${detail}\n`,
+    );
+  }
 }
 
 interface UpdateTarget {
@@ -330,6 +382,7 @@ async function updateSkill(
   remotes: Manifest["remotes"],
   home: string,
   refOverride: string | undefined,
+  keep: number,
 ): Promise<UpdateOutcome> {
   const { skill, baseDir, stateDir } = target;
   const remote = remotes[skill.remote];
@@ -372,6 +425,10 @@ async function updateSkill(
 
   if (prev !== undefined && prev.sha === sha) {
     process.stdout.write(`${pc.bold(skill.name)} is up to date.\n`);
+    // No snapshot or state change to prune around, but a prior update may have
+    // left older snapshots. Still apply retention so a long-running deployment
+    // does not accumulate unbounded backups.
+    await pruneAfterMutation(stateDir, skill.name, prev, keep);
     return { name: skill.name, status: "up-to-date", conflicts: [] };
   }
 
@@ -380,17 +437,22 @@ async function updateSkill(
   try {
     await materializeSrc(repoPath, sha, skill.src, upstreamDir);
 
-    const [base, upstream] = await Promise.all([
-      readTree(baseSkillDir(stateDir, skill.name)),
-      readTree(upstreamDir),
-    ]);
+    const baseDir = baseSkillDir(stateDir, skill.name);
+    const [base, upstream] = await Promise.all([readTree(baseDir), readTree(upstreamDir)]);
 
     const result = mergeTrees(base, upstream, live);
 
-    // Snapshot the live copy before mutating dest, so the update is reversible
-    // even when it lands conflict markers.
-    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-    await snapshotLocal(backupSnapshotDir(stateDir, skill.name, timestamp), dest);
+    // Snapshot the live copy + base + the SkillState as it stands now, before
+    // mutating anything. The snapshot is the rollback target for this update,
+    // whether the merge ends clean or in conflict. If `prev` is undefined (no
+    // state entry yet), there is nothing meaningful to snapshot; this is the
+    // very first sync for a manifest-but-no-state skill and a later `add`
+    // would re-initialize anyway.
+    let timestamp: string | undefined;
+    if (prev !== undefined) {
+      timestamp = nowSnapshotTimestamp();
+      await takeSnapshot(backupSnapshotDir(stateDir, skill.name, timestamp), dest, baseDir, prev);
+    }
 
     // Stage the merged tree in dest's parent, then swap it into place atomically.
     const staging = stagingPathFor(dest);
@@ -400,17 +462,28 @@ async function updateSkill(
 
     if (!result.clean) {
       // Conflicts are now in dest. Leave base untouched so the merge base does
-      // not advance, but stamp pendingSha in state so `resolve` knows which
-      // upstream commit the markers came from (the ref may move before then).
-      // state.json is the commit point: write it last.
-      markPending(state, skill.name, sha);
+      // not advance, but stamp pendingSha+pendingSnapshotTs in state so
+      // `resolve` knows which upstream commit the markers came from (the ref
+      // may move before then) and retention can preserve the snapshot the
+      // pending conflict depends on. state.json is the commit point: write last.
+      // A conflict implies `prev` existed (snapshot was taken), so the
+      // timestamp is defined.
+      if (timestamp === undefined) {
+        throw new Error(
+          `internal error: conflict outcome for '${skill.name}' without a snapshot timestamp`,
+        );
+      }
+      markPending(state, skill.name, sha, timestamp);
       await writeState(statePath(stateDir), state);
+      // Do NOT prune on the conflict path: the just-taken snapshot is the
+      // user's recovery point, and `pendingSnapshotTs` protects it but there
+      // is no reason to risk pruning other backups during a failed merge.
       process.stdout.write(`${pc.bold(skill.name)} has conflicts; markers written to dest.\n`);
       return { name: skill.name, status: "conflict", conflicts: result.conflicts };
     }
 
     // Base advances to the upstream tree (the new merge base) on a clean merge.
-    await populateBase(baseSkillDir(stateDir, skill.name), upstreamDir);
+    await populateBase(baseDir, upstreamDir);
 
     // state.json is the commit point: write it last.
     state.skills[skill.name] = {
@@ -421,6 +494,11 @@ async function updateSkill(
       syncedAt: new Date().toISOString(),
     };
     await writeState(statePath(stateDir), state);
+
+    // Retention: after a successful clean merge, prune older snapshots. The
+    // freshly-written state has no pendingSnapshotTs (we just resolved or
+    // never had a conflict), so the protected set is empty.
+    await pruneAfterMutation(stateDir, skill.name, state.skills[skill.name], keep);
 
     process.stdout.write(`Updated ${pc.bold(skill.name)} to ${sha.slice(0, 12)}\n`);
     return { name: skill.name, status: "clean", conflicts: [] };
@@ -512,7 +590,7 @@ async function runUpdate(name: string | undefined, options: UpdateOptions): Prom
 
   const outcomes: UpdateOutcome[] = [];
   for (const target of selected) {
-    outcomes.push(await updateSkill(target, remotes, home, options.ref));
+    outcomes.push(await updateSkill(target, remotes, home, options.ref, options.keep));
   }
 
   reportConflicts(outcomes);
@@ -534,7 +612,11 @@ async function runUpdate(name: string | undefined, options: UpdateOptions): Prom
  * the marker check passes for them and resolving accepts whatever currently
  * lives in dest (the "kept local" side) as the user's chosen resolution.
  */
-async function runResolve(name: string): Promise<void> {
+interface ResolveOptions {
+  keep: number;
+}
+
+async function runResolve(name: string, options: ResolveOptions): Promise<void> {
   const home = homedir();
   const projectPath = projectManifestPath();
   const globalPath = globalManifestPath(home);
@@ -641,20 +723,27 @@ async function runResolve(name: string): Promise<void> {
   try {
     await materializeSrc(repoPath, pendingSha, skill.src, upstreamDir);
 
-    // Snapshot the resolved local copy so the resolution is itself reversible.
-    // resolve does not mutate dest, but the snapshot mirrors update's habit
-    // and gives a later rollback a clean target.
-    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-    await snapshotLocal(backupSnapshotDir(stateDir, skill.name, timestamp), dest);
+    // Snapshot the resolved local copy + current base + the pre-resolve
+    // SkillState (with pendingSha still set), so a later rollback to this
+    // snapshot can restore the user back into the resolved-but-not-yet-
+    // committed state and try again.
+    const baseDir = baseSkillDir(stateDir, skill.name);
+    const timestamp = nowSnapshotTimestamp();
+    await takeSnapshot(backupSnapshotDir(stateDir, skill.name, timestamp), dest, baseDir, prev);
 
     // Advance base to the pending upstream tree (atomic via copyDirAtomic).
-    await populateBase(baseSkillDir(stateDir, skill.name), upstreamDir);
+    await populateBase(baseDir, upstreamDir);
 
     // state.json is the commit point: write last, clearing pendingSha. The
     // operation is idempotent on crash recovery because pendingSha stays set
     // until this write commits.
     commitResolution(state, skill.name, pendingSha, new Date().toISOString());
     await writeState(statePath(stateDir), state);
+
+    // Retention: prune the resolved skill's older snapshots. pendingSha and
+    // pendingSnapshotTs were just cleared, so nothing is protected; the
+    // newest (just-taken) snapshot is always within the kept window.
+    await pruneAfterMutation(stateDir, skill.name, state.skills[skill.name], options.keep);
 
     process.stdout.write(
       `Resolved ${pc.bold(skill.name)} at ${pendingSha.slice(0, 12)}; base advanced.\n`,
@@ -903,6 +992,135 @@ async function runCheck(name: string | undefined, options: CheckOptions): Promis
   }
 }
 
+interface RollbackOptions {
+  to?: string;
+}
+
+/** Resolve the manifest + state dir holding the named skill, or throw if unknown. */
+async function findSkillTarget(name: string): Promise<UpdateTarget> {
+  const home = homedir();
+  const projectPath = projectManifestPath();
+  const globalPath = globalManifestPath(home);
+  const [project, global] = await Promise.all([
+    loadManifestFile(projectPath),
+    loadManifestFile(globalPath),
+  ]);
+  const { targets } = resolveUpdateTargets(
+    project,
+    manifestBaseDir(projectPath),
+    projectStateDir(),
+    global,
+    manifestBaseDir(globalPath),
+    globalStateDir(home),
+    false,
+  );
+  const target = targets.find((t) => t.skill.name === name);
+  if (target === undefined) {
+    throw new ManifestValidationError(`no tracked skill named '${name}'`);
+  }
+  return target;
+}
+
+/**
+ * `skync rollback <name> [--to <timestamp>]`: discard local changes back to a
+ * prior snapshot.
+ *
+ * Without `--to`: list available snapshots newest-first. Exits 0; an empty
+ * list is reported but is not an error.
+ *
+ * With `--to`: validates the timestamp exists in `backups/<name>/`, takes a
+ * safety snapshot of the current dest+base+state first (so the rollback is
+ * itself reversible by another rollback), then restores dest, base, and the
+ * skill's state entry from the snapshot. The restored state is written back
+ * into state.json as the commit point so subsequent three-way merges align
+ * with the rolled-back base, not the post-update one.
+ */
+async function runRollback(name: string, options: RollbackOptions): Promise<void> {
+  const target = await findSkillTarget(name);
+  const { skill, baseDir: manifestBase, stateDir } = target;
+  const home = homedir();
+  const dest = expandDest(skill.dest, { home, baseDir: manifestBase });
+  const skillBackups = backupsDir(stateDir, skill.name);
+  const snapshots = await listSnapshots(skillBackups);
+
+  if (options.to === undefined) {
+    if (snapshots.length === 0) {
+      process.stdout.write(`No snapshots for ${pc.bold(name)}.\n`);
+      return;
+    }
+    process.stdout.write(`Snapshots for ${pc.bold(name)} (newest first):\n`);
+    // Number from 1 so the listing matches human counting; do NOT accept the
+    // index as `--to` since indices drift as snapshots prune.
+    const newestFirst = [...snapshots].reverse();
+    for (let i = 0; i < newestFirst.length; i++) {
+      process.stdout.write(`  ${i + 1}. ${newestFirst[i]}\n`);
+    }
+    return;
+  }
+
+  // Validate the shape of --to before joining it into a backup path. The
+  // existing includes() check below would also reject anything not on disk,
+  // but checking the shape first gives a clearer error and forecloses any
+  // possibility of a path-separator or traversal value slipping in through a
+  // future refactor.
+  if (!SNAPSHOT_TIMESTAMP_RE.test(options.to)) {
+    throw new ManifestValidationError(
+      `--to '${options.to}' is not a valid snapshot timestamp ` +
+        `(expected an ISO-style ${new Date(0).toISOString().replace(/[:.]/g, "-")} form). ` +
+        `Run 'skync rollback ${name}' without --to to list available snapshots.`,
+    );
+  }
+  if (!snapshots.includes(options.to)) {
+    const list = snapshots.length === 0 ? "<none>" : snapshots.slice().reverse().join(", ");
+    throw new ManifestValidationError(
+      `no snapshot '${options.to}' for skill '${name}'. Available: ${list}.`,
+    );
+  }
+
+  // Read state for this skill so we can take a safety snapshot of the current
+  // state before overwriting dest and base. If state has no entry, fabricate
+  // one from the manifest for the safety snapshot's meta (rollback still
+  // restores into a real on-disk state.json afterward).
+  const state = await readState(statePath(stateDir));
+  const current = state.skills[skill.name];
+
+  // Pre-rollback snapshot: cheap insurance against a fat-fingered --to. If
+  // current state is missing we skip the safety snapshot rather than block
+  // the rollback; takeSnapshot needs a meta entry and there is nothing
+  // meaningful to record.
+  if (current !== undefined) {
+    try {
+      const safetyTs = nowSnapshotTimestamp();
+      await takeSnapshot(
+        backupSnapshotDir(stateDir, skill.name, safetyTs),
+        dest,
+        baseSkillDir(stateDir, skill.name),
+        current,
+      );
+    } catch (err) {
+      // Best-effort; do not abort rollback because the safety snapshot failed.
+      const detail = err instanceof Error ? err.message : String(err);
+      process.stderr.write(
+        `${pc.yellow("warning")}: could not take pre-rollback safety snapshot: ${detail}\n`,
+      );
+    }
+  }
+
+  const snapshotDir = backupSnapshotDir(stateDir, skill.name, options.to);
+  const restored = await restoreSnapshot(dest, baseSkillDir(stateDir, skill.name), snapshotDir);
+
+  // Commit the restored SkillState as the new authoritative state. Write last
+  // so a crash mid-rollback leaves dest+base updated but state stale; the
+  // worst-case outcome is the user re-runs rollback rather than silent merge
+  // misbehavior.
+  state.skills[skill.name] = restored;
+  await writeState(statePath(stateDir), state);
+
+  process.stdout.write(
+    `Restored ${pc.bold(name)} from ${options.to} (sha ${restored.sha.slice(0, 12)}).\n`,
+  );
+}
+
 function buildProgram(): Command {
   const program = new Command();
   program
@@ -937,6 +1155,12 @@ function buildProgram(): Command {
     .description("Pull non-overlapping upstream changes for one or all tracked skills.")
     .option("--ref <ref>", "branch, tag, or commit to update to (default: the remote's ref)")
     .option("--global", "update only globally tracked skills")
+    .option(
+      "--keep <n>",
+      `number of backup snapshots to retain per skill (default: ${DEFAULT_KEEP})`,
+      parseKeep,
+      DEFAULT_KEEP,
+    )
     .action(async (name: string | undefined, options: UpdateOptions) => {
       await runUpdate(name, options);
     });
@@ -946,8 +1170,27 @@ function buildProgram(): Command {
     .description(
       "Mark a conflicted skill as resolved: verify no markers remain, snapshot, and advance base to the pending upstream commit.",
     )
-    .action(async (name: string) => {
-      await runResolve(name);
+    .option(
+      "--keep <n>",
+      `number of backup snapshots to retain per skill (default: ${DEFAULT_KEEP})`,
+      parseKeep,
+      DEFAULT_KEEP,
+    )
+    .action(async (name: string, options: ResolveOptions) => {
+      await runResolve(name, options);
+    });
+
+  program
+    .command("rollback <name>")
+    .description(
+      "Restore a skill from a backup snapshot. Without --to, lists available snapshots.",
+    )
+    .option(
+      "--to <timestamp>",
+      "snapshot timestamp to restore (omit to list available snapshots)",
+    )
+    .action(async (name: string, options: RollbackOptions) => {
+      await runRollback(name, options);
     });
 
   program
