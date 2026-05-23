@@ -58,6 +58,7 @@ Edit files under `.claude/skills/grill-me` freely; skync only treats overlapping
 | Command | Purpose | Exit codes |
 | --- | --- | --- |
 | `add <name>` | Register and vendor a new skill | 0 success, 1 error |
+| `discover <name>` | Locate a skill folder in a remote repo (read-only) | 0 single match, 1 zero or multiple |
 | `list` | List tracked skills | 0 |
 | `check [name]` | Dry-run merge; scheduler-friendly | 0/1/2/3 (see below) |
 | `status [name]` | Local-vs-base modifications | 0 (errors via global handler) |
@@ -180,6 +181,21 @@ skync rollback <name> --to <timestamp>
 Without `--to`, lists available snapshots newest-first. With `--to`, validates the timestamp, takes a safety snapshot of the current state, then atomically restores `dest`, `base`, and the state entry from the snapshot.
 
 Timestamps look like `2026-05-23T14-07-42-318Z` (the on-disk subdirectory name under `<state-dir>/backups/<skill>/`).
+
+### `discover <name>`
+
+```
+skync discover <name> --repo <url> [--ref <ref>]
+```
+
+Read-only debug command. Fetches the repo into the same cache `add` uses, resolves the ref, and walks the tree at that commit for a folder whose basename equals `<name>` AND whose `SKILL.md` carries YAML frontmatter `name: <name>`. Useful for previewing what `skync add <name> --repo <url>` would resolve to, or for listing candidates after a multi-match error.
+
+- `--repo <url>` git URL of the upstream repo (required)
+- `--ref <ref>` branch, tag, or commit to search (default: remote HEAD)
+
+Folders whose path contains `.git`, `node_modules`, `dist`, `build`, `target`, or `.venv` at any depth are skipped, as is a `SKILL.md` at the repo root. The match is a strict intersection: folder name and frontmatter `name:` must both equal `<name>`. Discovery writes nothing to your manifest or state; it only populates the shared cache directory.
+
+Exit codes: `0` on a single match (the path is printed to stdout, nothing else, so it can be piped into `skync add --src`). `1` on zero matches or more than one match (candidates listed on stderr).
 
 ## Manifest
 
