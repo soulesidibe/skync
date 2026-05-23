@@ -31,6 +31,11 @@ import {
 } from "./paths.js";
 import { ensureRemoteClone, resolveRef, materializeSrc } from "./remote-cache.js";
 import {
+  discoverSkill,
+  DiscoveryNoMatchError,
+  DiscoveryMultipleMatchError,
+} from "./discover.js";
+import {
   readState,
   writeState,
   populateBase,
@@ -275,6 +280,79 @@ async function runAdd(name: string, options: AddOptions): Promise<void> {
       `Added ${pc.bold(name)} from ${remoteName} at ${sha.slice(0, 12)}\n`,
     );
     process.stdout.write(`  ${options.src} ${pc.dim("→")} ${dest}\n`);
+  }
+}
+
+interface DiscoverOptions {
+  repo: string;
+  ref?: string;
+}
+
+/**
+ * Resolve a remote ref through the cached clone. Symmetric with `runAdd`: when
+ * `--ref` is given, resolve it directly; otherwise resolve the remote's
+ * symbolic HEAD via `ls-remote --symref`, falling back to a plain `HEAD` rev-
+ * parse for repos whose remote does not expose the symref (rare, but possible).
+ */
+async function resolveDiscoverSha(
+  repoPath: string,
+  repoUrl: string,
+  ref: string | undefined,
+): Promise<string> {
+  if (ref !== undefined) {
+    return resolveRef(repoPath, ref);
+  }
+  try {
+    const { stdout } = await git(["ls-remote", "--symref", repoUrl, "HEAD"]);
+    const match = stdout.match(/^ref:\s+(\S+)\s+HEAD/m);
+    if (match) {
+      const headRef = match[1].replace(/^refs\/heads\//, "");
+      return resolveRef(repoPath, headRef);
+    }
+  } catch {
+    // Fall through to the plain HEAD attempt below.
+  }
+  return resolveRef(repoPath, "HEAD");
+}
+
+/**
+ * Read-only debug command: clone (or refresh) the upstream into the shared
+ * cache, resolve the ref, and report the single skill folder whose basename
+ * and SKILL.md frontmatter both equal `name`. Writes nothing to manifest or
+ * state. Exits 0 on a single match (path on stdout, nothing else); exits 1 on
+ * zero matches or multiple matches (candidate list on stderr, exit handled by
+ * the global catch which sets process.exitCode based on the thrown error).
+ */
+async function runDiscover(name: string, options: DiscoverOptions): Promise<void> {
+  const stateDir = projectStateDir();
+  const repoPath = await ensureRemoteClone(cacheDir(stateDir), options.repo);
+  const sha = await resolveDiscoverSha(repoPath, options.repo, options.ref);
+
+  try {
+    const path = await discoverSkill(repoPath, sha, name);
+    process.stdout.write(`${path}\n`);
+  } catch (err) {
+    if (err instanceof DiscoveryNoMatchError) {
+      process.stderr.write(
+        `${pc.red("error")}: no skill named '${name}' found in ${options.repo} at ${sha.slice(0, 7)}\n`,
+      );
+      process.exitCode = 1;
+      return;
+    }
+    if (err instanceof DiscoveryMultipleMatchError) {
+      process.stderr.write(
+        `${pc.red("error")}: multiple skill folders match '${name}' in ${options.repo} at ${sha.slice(0, 7)}:\n`,
+      );
+      for (const candidate of err.candidates) {
+        process.stderr.write(`  ${candidate}\n`);
+      }
+      process.stderr.write(
+        `re-run with skync add --src <path> to pick one\n`,
+      );
+      process.exitCode = 1;
+      return;
+    }
+    throw err;
   }
 }
 
@@ -1424,6 +1502,17 @@ function buildProgram(): Command {
     .option("--global", "use the global manifest and state instead of the project's")
     .action(async (name: string, options: AddOptions) => {
       await runAdd(name, options);
+    });
+
+  program
+    .command("discover <name>")
+    .description(
+      "Find the skill folder in a remote repo whose name matches both the folder basename and the SKILL.md frontmatter `name:` (read-only).",
+    )
+    .requiredOption("--repo <url>", "git repo URL to search")
+    .option("--ref <ref>", "branch, tag, or commit to search (default: remote HEAD)")
+    .action(async (name: string, options: DiscoverOptions) => {
+      await runDiscover(name, options);
     });
 
   program

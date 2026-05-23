@@ -1754,3 +1754,262 @@ describe("skync diff (CLI)", () => {
     }
   });
 });
+
+/**
+ * Build a fixture git repo whose tree is described by `files`; each entry's
+ * path is created and written verbatim. Returns the repo path and `file://`
+ * URL. Used by the discover suite to exercise tree shapes the discovery rule
+ * needs to reject or pick.
+ */
+async function createDiscoverFixture(
+  files: { path: string; contents: string }[],
+): Promise<{ dir: string; url: string }> {
+  const dir = await mkdtemp(join(tmpdir(), "skync-discover-cli-"));
+  for (const entry of files) {
+    const abs = join(dir, entry.path);
+    await mkdir(dirname(abs), { recursive: true });
+    await writeFile(abs, entry.contents);
+  }
+  await run("git", ["init", "-q", "-b", "main"], { cwd: dir, env: GIT_ENV });
+  await run("git", ["add", "-A"], { cwd: dir, env: GIT_ENV });
+  await run("git", ["commit", "-q", "-m", "init"], { cwd: dir, env: GIT_ENV });
+  return { dir, url: `file://${dir}` };
+}
+
+function fm(name: string, body = ""): string {
+  return `---\nname: ${name}\n---\n${body}`;
+}
+
+describe("skync discover (CLI)", () => {
+  it("prints the single matching folder path and exits 0", async () => {
+    const fixture = await createDiscoverFixture([
+      { path: "skills/demo/SKILL.md", contents: fm("demo", "demo skill\n") },
+    ]);
+    const work = await mkdtemp(join(tmpdir(), "skync-disc-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const res = await runCli(
+        ["discover", "demo", "--repo", fixture.url],
+        work,
+        home,
+      );
+      expect(res.code).toBe(0);
+      expect(res.stdout).toBe("skills/demo\n");
+      expect(res.stderr).toBe("");
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("exits 1 with the repo URL and short SHA when nothing matches", async () => {
+    const fixture = await createDiscoverFixture([
+      { path: "skills/other/SKILL.md", contents: fm("other") },
+    ]);
+    const work = await mkdtemp(join(tmpdir(), "skync-disc-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const res = await runCli(
+        ["discover", "demo", "--repo", fixture.url],
+        work,
+        home,
+      );
+      expect(res.code).toBe(1);
+      expect(res.stderr).toMatch(/no skill named 'demo'/);
+      expect(res.stderr).toContain(fixture.url);
+      expect(res.stderr).toMatch(/\bat [0-9a-f]{7}\b/);
+      expect(res.stdout).toBe("");
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("exits 1 and lists every candidate on multiple matches", async () => {
+    const fixture = await createDiscoverFixture([
+      { path: "skills/demo/SKILL.md", contents: fm("demo") },
+      { path: "vendor/skills/demo/SKILL.md", contents: fm("demo") },
+    ]);
+    const work = await mkdtemp(join(tmpdir(), "skync-disc-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const res = await runCli(
+        ["discover", "demo", "--repo", fixture.url],
+        work,
+        home,
+      );
+      expect(res.code).toBe(1);
+      expect(res.stderr).toMatch(/multiple skill folders match 'demo'/);
+      expect(res.stderr).toContain("  skills/demo\n");
+      expect(res.stderr).toContain("  vendor/skills/demo\n");
+      expect(res.stderr).toMatch(/skync add --src/);
+      expect(res.stdout).toBe("");
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("honors --ref against a tagged earlier commit", async () => {
+    const fixture = await createDiscoverFixture([
+      { path: "skills/demo/SKILL.md", contents: fm("demo", "v1\n") },
+    ]);
+    // Tag the first commit, then rewrite the same folder so it no longer
+    // matches on main. --ref v1 should still find it via the tag's tree.
+    try {
+      await run("git", ["tag", "v1"], { cwd: fixture.dir, env: GIT_ENV });
+      await writeFile(
+        join(fixture.dir, "skills", "demo", "SKILL.md"),
+        fm("renamed", "v2\n"),
+      );
+      await run("git", ["add", "-A"], { cwd: fixture.dir, env: GIT_ENV });
+      await run("git", ["commit", "-q", "-m", "rename"], {
+        cwd: fixture.dir,
+        env: GIT_ENV,
+      });
+
+      const work = await mkdtemp(join(tmpdir(), "skync-disc-"));
+      const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+      try {
+        const tagged = await runCli(
+          ["discover", "demo", "--repo", fixture.url, "--ref", "v1"],
+          work,
+          home,
+        );
+        expect(tagged.code).toBe(0);
+        expect(tagged.stdout).toBe("skills/demo\n");
+
+        const head = await runCli(
+          ["discover", "demo", "--repo", fixture.url],
+          work,
+          home,
+        );
+        expect(head.code).toBe(1);
+        expect(head.stderr).toMatch(/no skill named 'demo'/);
+      } finally {
+        await rm(work, { recursive: true, force: true });
+        await rm(home, { recursive: true, force: true });
+      }
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("resolves remote HEAD when --ref is omitted", async () => {
+    const fixture = await createDiscoverFixture([
+      { path: "skills/demo/SKILL.md", contents: fm("demo") },
+    ]);
+    const work = await mkdtemp(join(tmpdir(), "skync-disc-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const res = await runCli(
+        ["discover", "demo", "--repo", fixture.url],
+        work,
+        home,
+      );
+      expect(res.code).toBe(0);
+      expect(res.stdout).toBe("skills/demo\n");
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("writes nothing to skync.yaml or state.json (only the cache directory)", async () => {
+    const fixture = await createDiscoverFixture([
+      { path: "skills/demo/SKILL.md", contents: fm("demo") },
+    ]);
+    const work = await mkdtemp(join(tmpdir(), "skync-disc-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const res = await runCli(
+        ["discover", "demo", "--repo", fixture.url],
+        work,
+        home,
+      );
+      expect(res.code).toBe(0);
+
+      // No manifest, no state.json. Cache directory may exist (lazy clone).
+      await expect(readFile(join(work, "skync.yaml"))).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      await expect(
+        readFile(join(work, ".skync", "state.json")),
+      ).rejects.toMatchObject({ code: "ENOENT" });
+      const skyncEntries = await readdir(join(work, ".skync")).catch(() => []);
+      expect(skyncEntries).toEqual(["cache"]);
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("output can be piped into skync add --src to vendor the skill", async () => {
+    const fixture = await createDiscoverFixture([
+      { path: "skills/demo/SKILL.md", contents: fm("demo", "body\n") },
+    ]);
+    const work = await mkdtemp(join(tmpdir(), "skync-disc-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const disc = await runCli(
+        ["discover", "demo", "--repo", fixture.url],
+        work,
+        home,
+      );
+      expect(disc.code).toBe(0);
+      const src = disc.stdout.trim();
+      const add = await runCli(
+        [
+          "add",
+          "demo",
+          "--repo",
+          fixture.url,
+          "--src",
+          src,
+          "--dest",
+          "vendor/demo",
+        ],
+        work,
+        home,
+      );
+      expect(add.code).toBe(0);
+      const skillFile = await readFile(
+        join(work, "vendor", "demo", "SKILL.md"),
+        "utf8",
+      );
+      expect(skillFile).toContain("name: demo");
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("ignores SKILL.md files inside denylisted directories at the CLI layer too", async () => {
+    const fixture = await createDiscoverFixture([
+      { path: "node_modules/demo/SKILL.md", contents: fm("demo") },
+      { path: "build/demo/SKILL.md", contents: fm("demo") },
+      { path: "skills/demo/SKILL.md", contents: fm("demo") },
+    ]);
+    const work = await mkdtemp(join(tmpdir(), "skync-disc-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const res = await runCli(
+        ["discover", "demo", "--repo", fixture.url],
+        work,
+        home,
+      );
+      expect(res.code).toBe(0);
+      expect(res.stdout).toBe("skills/demo\n");
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+});
