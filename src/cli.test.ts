@@ -1375,3 +1375,382 @@ describe("skync resolve retention", () => {
     }
   });
 });
+
+describe("skync status (CLI)", () => {
+  it("prints an empty-state message and exits 0 with no manifests", async () => {
+    const work = await mkdtemp(join(tmpdir(), "skync-status-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const res = await runCli(["status"], work, home);
+      expect(res.code).toBe(0);
+      expect(res.stdout).toMatch(/no tracked skills/i);
+    } finally {
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("reports [clean] for a freshly added skill with no local edits", async () => {
+    const fixture = await createFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-status-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const add = await runCli(
+        ["add", "demo", "--repo", fixture.url, "--src", "skills/demo", "--dest", "vendor/demo"],
+        work,
+        home,
+      );
+      expect(add.code).toBe(0);
+
+      const res = await runCli(["status"], work, home);
+      expect(res.code).toBe(0);
+      expect(res.stdout).toContain("[clean]");
+      expect(res.stdout).toContain("demo");
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("reports [modified] with counts and per-file lines when dest has local edits", async () => {
+    const fixture = await createFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-status-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const add = await runCli(
+        ["add", "demo", "--repo", fixture.url, "--src", "skills/demo", "--dest", "vendor/demo"],
+        work,
+        home,
+      );
+      expect(add.code).toBe(0);
+
+      // One modify, one add, one delete in the local copy.
+      await writeFile(join(work, "vendor/demo/SKILL.md"), "demo v1 LOCAL\n");
+      await writeFile(join(work, "vendor/demo/NEW.md"), "added\n");
+      // The fresh fixture only seeded SKILL.md; nothing else to delete here.
+      // Adding a second baseline file via a follow-up add isn't worth the test
+      // setup; modify + add covers the headline.
+
+      const res = await runCli(["status"], work, home);
+      expect(res.code).toBe(0);
+      expect(res.stdout).toContain("[modified]");
+      expect(res.stdout).toContain("+1");
+      expect(res.stdout).toMatch(/~1/);
+      expect(res.stdout).toContain("SKILL.md");
+      expect(res.stdout).toContain("NEW.md");
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("flags [pending-conflict] when state.pendingSha is set", async () => {
+    const { fixture, work, home } = await setupConflict();
+    try {
+      const res = await runCli(["status"], work, home);
+      expect(res.code).toBe(0);
+      expect(res.stdout).toContain("[pending-conflict]");
+      // Conflict markers in SKILL.md are detected and listed.
+      expect(res.stdout).toMatch(/markers in: .*SKILL\.md/);
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("flags [pending-conflict] from stray markers even when pendingSha was scrubbed", async () => {
+    const { fixture, work, home } = await setupConflict();
+    try {
+      // Hand-scrub pendingSha from state; markers remain in dest.
+      const sp = join(work, ".skync/state.json");
+      const state = JSON.parse(await readFile(sp, "utf8"));
+      delete state.skills.demo.pendingSha;
+      await writeFile(sp, `${JSON.stringify(state, null, 2)}\n`);
+
+      const res = await runCli(["status"], work, home);
+      expect(res.code).toBe(0);
+      expect(res.stdout).toContain("[pending-conflict]");
+      expect(res.stdout).toMatch(/markers in: .*SKILL\.md/);
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("reports [dest-missing] when the destination directory was removed", async () => {
+    const fixture = await createFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-status-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const add = await runCli(
+        ["add", "demo", "--repo", fixture.url, "--src", "skills/demo", "--dest", "vendor/demo"],
+        work,
+        home,
+      );
+      expect(add.code).toBe(0);
+      await rm(join(work, "vendor/demo"), { recursive: true, force: true });
+
+      const res = await runCli(["status"], work, home);
+      expect(res.code).toBe(0);
+      expect(res.stdout).toContain("[dest-missing]");
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("reports [interrupted-swap] when a .skync-old sidecar is present", async () => {
+    const fixture = await createFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-status-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const add = await runCli(
+        ["add", "demo", "--repo", fixture.url, "--src", "skills/demo", "--dest", "vendor/demo"],
+        work,
+        home,
+      );
+      expect(add.code).toBe(0);
+      await mkdir(join(work, "vendor/demo.skync-old"), { recursive: true });
+      await writeFile(join(work, "vendor/demo.skync-old/SKILL.md"), "interrupted\n");
+
+      const res = await runCli(["status"], work, home);
+      expect(res.code).toBe(0);
+      expect(res.stdout).toContain("[interrupted-swap]");
+      expect(res.stdout).toMatch(/skync update/);
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("reports [no-state] when a manifest skill has no state entry", async () => {
+    const fixture = await createFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-status-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const add = await runCli(
+        ["add", "demo", "--repo", fixture.url, "--src", "skills/demo", "--dest", "vendor/demo"],
+        work,
+        home,
+      );
+      expect(add.code).toBe(0);
+      const sp = join(work, ".skync/state.json");
+      const state = JSON.parse(await readFile(sp, "utf8"));
+      delete state.skills.demo;
+      await writeFile(sp, JSON.stringify(state, null, 2));
+
+      const res = await runCli(["status"], work, home);
+      expect(res.code).toBe(0);
+      expect(res.stdout).toContain("[no-state]");
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("filters to the named skill and exits 1 on unknown name", async () => {
+    const fixtureA = await createFixtureRepo();
+    const fixtureB = await createFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-status-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const a = await runCli(
+        ["add", "alpha", "--repo", fixtureA.url, "--src", "skills/demo", "--dest", "vendor/alpha"],
+        work,
+        home,
+      );
+      expect(a.code).toBe(0);
+      const b = await runCli(
+        ["add", "bravo", "--repo", fixtureB.url, "--src", "skills/demo", "--dest", "vendor/bravo"],
+        work,
+        home,
+      );
+      expect(b.code).toBe(0);
+
+      const only = await runCli(["status", "alpha"], work, home);
+      expect(only.code).toBe(0);
+      expect(only.stdout).toContain("alpha");
+      expect(only.stdout).not.toContain("bravo");
+
+      const miss = await runCli(["status", "ghost"], work, home);
+      expect(miss.code).toBe(1);
+      expect(miss.stderr).toMatch(/no tracked skill named 'ghost'/);
+    } finally {
+      await rm(fixtureA.dir, { recursive: true, force: true });
+      await rm(fixtureB.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("modifies no user-visible state (read-only invariant)", async () => {
+    const fixture = await createFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-status-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const add = await runCli(
+        ["add", "demo", "--repo", fixture.url, "--src", "skills/demo", "--dest", "vendor/demo"],
+        work,
+        home,
+      );
+      expect(add.code).toBe(0);
+      // Some local edits to make status do real work.
+      await writeFile(join(work, "vendor/demo/SKILL.md"), "edited\n");
+      await writeFile(join(work, "vendor/demo/NEW.md"), "added\n");
+
+      const stateDirSnap0 = await snapshotTree(join(work, ".skync"));
+      const destSnap0 = await snapshotTree(join(work, "vendor/demo"));
+      const projManifest0 = await snapshotFile(join(work, "skync.yaml"));
+
+      const res = await runCli(["status"], work, home);
+      expect(res.code).toBe(0);
+
+      // Whole .skync directory (state, base, cache, backups) is byte-identical:
+      // status performs no network or filesystem mutation.
+      expect(await snapshotTree(join(work, ".skync"))).toEqual(stateDirSnap0);
+      expect(await snapshotTree(join(work, "vendor/demo"))).toEqual(destSnap0);
+      expect(await snapshotFile(join(work, "skync.yaml"))).toBe(projManifest0);
+
+      const siblings = await siblingsMatching(
+        join(work, "vendor"),
+        /^demo\.(skync-staging|skync-old)/,
+      );
+      expect(siblings).toEqual([]);
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("skync diff (CLI)", () => {
+  it("errors with a clean message on an unknown skill name", async () => {
+    const work = await mkdtemp(join(tmpdir(), "skync-diff-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const res = await runCli(["diff", "ghost"], work, home);
+      expect(res.code).toBe(1);
+      expect(res.stderr).toMatch(/no tracked skill named 'ghost'/);
+      expect(res.stderr).not.toMatch(/at .*\(.*:\d+:\d+\)/);
+    } finally {
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("shows local-vs-base and upstream-vs-base sections with unified hunks", async () => {
+    const fixture = await createFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-diff-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const add = await runCli(
+        ["add", "demo", "--repo", fixture.url, "--src", "skills/demo", "--dest", "vendor/demo"],
+        work,
+        home,
+      );
+      expect(add.code).toBe(0);
+
+      // Local modification.
+      await writeFile(join(work, "vendor/demo/SKILL.md"), "demo v1 LOCAL\n");
+      // Upstream advances on a different file (non-overlap).
+      await commitToFixture(fixture.dir, { "skills/demo/EXTRA.md": "extra\n" }, "add extra");
+
+      const res = await runCli(["diff", "demo"], work, home);
+      expect(res.code).toBe(0);
+      expect(res.stdout).toContain("local vs base");
+      expect(res.stdout).toContain("upstream vs base");
+
+      // Local side: SKILL.md modified.
+      expect(res.stdout).toMatch(/--- a\/SKILL\.md/);
+      expect(res.stdout).toMatch(/\+\+\+ b\/SKILL\.md/);
+      expect(res.stdout).toContain("-demo v1");
+      expect(res.stdout).toContain("+demo v1 LOCAL");
+
+      // Upstream side: EXTRA.md added against base.
+      expect(res.stdout).toContain("EXTRA.md");
+      expect(res.stdout).toMatch(/\+extra/);
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("prints '(no changes)' for sections with nothing to report", async () => {
+    const fixture = await createFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-diff-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const add = await runCli(
+        ["add", "demo", "--repo", fixture.url, "--src", "skills/demo", "--dest", "vendor/demo"],
+        work,
+        home,
+      );
+      expect(add.code).toBe(0);
+
+      // Fresh add: local == base == upstream, no diffs in either section.
+      const res = await runCli(["diff", "demo"], work, home);
+      expect(res.code).toBe(0);
+      expect(res.stdout).toContain("local vs base");
+      expect(res.stdout).toContain("upstream vs base");
+      // Both sections should be empty.
+      expect((res.stdout.match(/\(no changes\)/g) ?? []).length).toBe(2);
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("modifies no user-visible state (read-only invariant, cache excepted)", async () => {
+    const fixture = await createFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-diff-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const add = await runCli(
+        ["add", "demo", "--repo", fixture.url, "--src", "skills/demo", "--dest", "vendor/demo"],
+        work,
+        home,
+      );
+      expect(add.code).toBe(0);
+      // Local edit + upstream advance, so diff has real work to do.
+      await writeFile(join(work, "vendor/demo/SKILL.md"), "edited\n");
+      await commitToFixture(fixture.dir, { "skills/demo/EXTRA.md": "extra\n" }, "add extra");
+
+      const destSnap0 = await snapshotTree(join(work, "vendor/demo"));
+      const baseSnap0 = await snapshotTree(join(work, ".skync/base/demo"));
+      const stateSnap0 = await snapshotFile(join(work, ".skync/state.json"));
+      const backupsSnap0 = await snapshotTree(join(work, ".skync/backups"));
+      const projManifest0 = await snapshotFile(join(work, "skync.yaml"));
+
+      const res = await runCli(["diff", "demo"], work, home);
+      expect(res.code).toBe(0);
+
+      // dest, base, state, backups, manifest all byte-identical. Cache may
+      // mutate (diff fetches upstream identically to check/update).
+      expect(await snapshotTree(join(work, "vendor/demo"))).toEqual(destSnap0);
+      expect(await snapshotTree(join(work, ".skync/base/demo"))).toEqual(baseSnap0);
+      expect(await snapshotFile(join(work, ".skync/state.json"))).toBe(stateSnap0);
+      expect(await snapshotTree(join(work, ".skync/backups"))).toEqual(backupsSnap0);
+      expect(await snapshotFile(join(work, "skync.yaml"))).toBe(projManifest0);
+
+      const siblings = await siblingsMatching(
+        join(work, "vendor"),
+        /^demo\.(skync-staging|skync-old)/,
+      );
+      expect(siblings).toEqual([]);
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+});
