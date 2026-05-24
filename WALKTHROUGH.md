@@ -23,12 +23,10 @@ Exit 0 on a single match. Exit 1 if there are zero matches or more than one (can
 **Step 2. Add the skill.**
 
 ```sh
-skync add grill-me \
-  --repo https://github.com/mattpocock/skills \
-  --dest .claude/skills/grill-me
+skync add grill-me --repo https://github.com/mattpocock/skills
 ```
 
-`--src` is omitted on purpose. `add` runs the same discovery logic internally and records the resolved path in the manifest. Output:
+`--src` and `--dest` are both omitted on purpose. `add` runs discovery internally to resolve `--src` and defaults `--dest` to the Claude Code skill convention `.claude/skills/grill-me`. Both resolved values are recorded in the manifest exactly as if you had typed them. Output:
 
 ```
 Added grill-me from skills at b8be62ffacb0
@@ -171,12 +169,10 @@ git commit -m "initial commit"
 From your project directory:
 
 ```sh
-skync add qa-skill \
-  --repo ~/skync-qa/upstream-repo \
-  --dest .claude/skills/qa-skill
+skync add qa-skill --repo ~/skync-qa/upstream-repo
 ```
 
-This vendors `skills/qa-skill` into `.claude/skills/qa-skill` and seeds `.skync/base/qa-skill/` from the initial commit.
+This vendors `skills/qa-skill` into `.claude/skills/qa-skill` (the default convention path) and seeds `.skync/base/qa-skill/` from the initial commit.
 
 **Step 3. Apply a non-overlapping upstream change.**
 
