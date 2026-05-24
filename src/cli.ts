@@ -151,11 +151,37 @@ async function runList(): Promise<void> {
 
 interface AddOptions {
   repo: string;
-  src: string;
+  src?: string;
   dest: string;
   remote?: string;
   ref?: string;
   global?: boolean;
+}
+
+/**
+ * Format a discovery failure to stderr in a single place, used by both
+ * `runDiscover` and `runAdd` so the two commands stay in lock-step on wording.
+ * Returns true when `err` was a typed discovery error and was handled; the
+ * caller still owns setting `process.exitCode` and returning.
+ */
+function writeDiscoveryError(err: unknown, repo: string, sha: string, name: string): boolean {
+  if (err instanceof DiscoveryNoMatchError) {
+    process.stderr.write(
+      `${pc.red("error")}: no skill named '${name}' found in ${repo} at ${sha.slice(0, 7)}\n`,
+    );
+    return true;
+  }
+  if (err instanceof DiscoveryMultipleMatchError) {
+    process.stderr.write(
+      `${pc.red("error")}: multiple skill folders match '${name}' in ${repo} at ${sha.slice(0, 7)}:\n`,
+    );
+    for (const candidate of err.candidates) {
+      process.stderr.write(`  ${candidate}\n`);
+    }
+    process.stderr.write(`re-run with skync add --src <path> to pick one\n`);
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -231,6 +257,26 @@ async function runAdd(name: string, options: AddOptions): Promise<void> {
 
   const repoPath = await ensureRemoteClone(cacheDir(stateDir), options.repo);
   const sha = await resolveRef(repoPath, ref);
+
+  // Resolve src up front so both the adopt and fresh branches consume the same
+  // value. When `--src` is omitted, discovery walks the repo at this SHA for a
+  // single folder whose basename and SKILL.md `name:` both equal `name`; the
+  // discovered path is recorded verbatim in manifest and state.
+  let srcPath: string;
+  if (options.src) {
+    srcPath = options.src;
+  } else {
+    try {
+      srcPath = await discoverSkill(repoPath, sha, name);
+    } catch (err) {
+      if (writeDiscoveryError(err, options.repo, sha, name)) {
+        process.exitCode = 1;
+        return;
+      }
+      throw err;
+    }
+  }
+
   const baseDest = baseSkillDir(stateDir, name);
   if (adopt) {
     // Leave dest untouched (it is the adopted local copy). Materialize current
@@ -238,19 +284,19 @@ async function runAdd(name: string, options: AddOptions): Promise<void> {
     // distinct from populateBase's own ".tmp-" temp so the two never collide.
     const tmpUpstream = `${baseDest}.adopt-${process.pid}-${Date.now()}`;
     try {
-      await materializeSrc(repoPath, sha, options.src, tmpUpstream);
+      await materializeSrc(repoPath, sha, srcPath, tmpUpstream);
       await populateBase(baseDest, tmpUpstream);
     } finally {
       await rm(tmpUpstream, { recursive: true, force: true });
     }
   } else {
-    await materializeSrc(repoPath, sha, options.src, dest);
+    await materializeSrc(repoPath, sha, srcPath, dest);
     await populateBase(baseDest, dest);
   }
 
   const updated = upsertSkill(
     { remotes, skills: loaded.skills },
-    { name, remote: remoteName, src: options.src, dest: options.dest },
+    { name, remote: remoteName, src: srcPath, dest: options.dest },
   );
   await saveManifestFile(manifestPath, updated);
 
@@ -258,7 +304,7 @@ async function runAdd(name: string, options: AddOptions): Promise<void> {
   const state = await readState(statePath(stateDir));
   state.skills[name] = {
     remote: remoteName,
-    src: options.src,
+    src: srcPath,
     dest: options.dest,
     sha,
     syncedAt: new Date().toISOString(),
@@ -279,7 +325,7 @@ async function runAdd(name: string, options: AddOptions): Promise<void> {
     process.stdout.write(
       `Added ${pc.bold(name)} from ${remoteName} at ${sha.slice(0, 12)}\n`,
     );
-    process.stdout.write(`  ${options.src} ${pc.dim("→")} ${dest}\n`);
+    process.stdout.write(`  ${srcPath} ${pc.dim("→")} ${dest}\n`);
   }
 }
 
@@ -332,23 +378,7 @@ async function runDiscover(name: string, options: DiscoverOptions): Promise<void
     const path = await discoverSkill(repoPath, sha, name);
     process.stdout.write(`${path}\n`);
   } catch (err) {
-    if (err instanceof DiscoveryNoMatchError) {
-      process.stderr.write(
-        `${pc.red("error")}: no skill named '${name}' found in ${options.repo} at ${sha.slice(0, 7)}\n`,
-      );
-      process.exitCode = 1;
-      return;
-    }
-    if (err instanceof DiscoveryMultipleMatchError) {
-      process.stderr.write(
-        `${pc.red("error")}: multiple skill folders match '${name}' in ${options.repo} at ${sha.slice(0, 7)}:\n`,
-      );
-      for (const candidate of err.candidates) {
-        process.stderr.write(`  ${candidate}\n`);
-      }
-      process.stderr.write(
-        `re-run with skync add --src <path> to pick one\n`,
-      );
+    if (writeDiscoveryError(err, options.repo, sha, name)) {
       process.exitCode = 1;
       return;
     }
@@ -1495,7 +1525,7 @@ function buildProgram(): Command {
       "Vendor a new skill from a remote repo, adopting an existing dest if one is present.",
     )
     .requiredOption("--repo <url>", "git repo URL to vendor from")
-    .requiredOption("--src <path>", "source path within the repo")
+    .option("--src <path>", "source path within the repo (auto-discovered when omitted)")
     .requiredOption("--dest <path>", "destination path for the vendored skill")
     .option("--remote <name>", "override the auto-derived remote name")
     .option("--ref <ref>", "branch, tag, or commit to vendor (default: remote HEAD)")
