@@ -34,9 +34,21 @@ Once published, the install will be:
 npx skync <command> ...
 ```
 
+## Concepts
+
+- **skill**: a tracked folder vendored from an upstream repo. A skill has a name, a source path inside the upstream repo, a local destination, and a recorded upstream SHA.
+- **dest**: the live copy of the skill in your project. This is the directory you edit freely. skync only touches it during `add`, `update`, `rollback`, and `resolve`.
+- **base**: skync's internal snapshot of "the upstream state we last synced from." Lives under `.skync/base/<skill-name>/`. The base is the merge ancestor for every three-way merge.
+- **upstream**: the current state of the skill folder in the remote repo at the configured ref.
+- **three-way merge**: how `update` reconciles your local edits with upstream changes. Changes between base and upstream that do not overlap your local edits apply silently. Changes that do overlap produce conflict markers.
+- **snapshot**: a timestamped backup of dest, base, and the skill's recorded state, taken before any mutation. Snapshots live under `.skync/backups/<skill-name>/<timestamp>/`.
+- **pendingSha** and **pendingSnapshotTs**: fields set in `.skync/state.json` when an `update` produces conflicts. `pendingSha` is the upstream commit the markers came from; `pendingSnapshotTs` pins the recovery snapshot so retention pruning cannot remove it.
+
+The typical round trip: `add` vendors the skill and seeds base from upstream. Edit dest freely at any time. `update` runs a three-way merge: non-overlapping upstream changes apply silently and base advances, while overlapping changes produce conflict markers and base is left untouched. Edit the markers out by hand, then `resolve` advances base to the pending upstream commit. If anything goes wrong at any step, `rollback` restores dest, base, and state from a snapshot.
+
 ## Quick start
 
-Adopt the `grill-me` skill from Matt Pocock's skills repo into a local project. `--src` can be omitted when the upstream layout is conventional; skync walks the repo and resolves it:
+For someone who already knows the concepts, adopting `grill-me` from Matt Pocock's skills repo:
 
 ```sh
 skync add grill-me \
@@ -44,13 +56,13 @@ skync add grill-me \
   --dest .claude/skills/grill-me
 ```
 
-If discovery finds no match or more than one, re-run with an explicit `--src` (see [`add`](#add-name) below). That fetches the upstream tree, vendors it at `.claude/skills/grill-me`, and records the skill in `skync.yaml`. Later, pull in any upstream changes:
+`--src` is omitted; discovery resolves it. Pull in upstream changes later:
 
 ```sh
 skync update grill-me
 ```
 
-Edit files under `.claude/skills/grill-me` freely; skync only treats overlapping changes as conflicts.
+For a step-by-step tutorial covering the full lifecycle (add, edit, update, conflict, resolve, rollback) see [WALKTHROUGH.md](WALKTHROUGH.md).
 
 ## Commands
 
@@ -86,13 +98,15 @@ Vendor a new skill from a remote repo.
 
 If `--dest` does not exist or is empty, skync vendors fresh and seeds the base tree from upstream. If `--dest` already contains files, skync adopts them as-is and seeds base from the current upstream commit, so any difference between dest and base shows up as a local modification. Upstream changes that predate the `add` are baked into base and will not re-apply on the first `update`.
 
+Writes: `skync.yaml`, `.skync/state.json`, `.skync/base/<name>/`, and `dest/` (when vendoring fresh).
+
 ### `list`
 
 ```
 skync list
 ```
 
-Print every skill from the project manifest (`./skync.yaml`) and the global manifest (`~/.config/skync/manifest.yaml`), with the upstream remote and `src → dest` paths. Project entries shadow global entries with the same name.
+Print every skill from the project manifest (`./skync.yaml`) and the global manifest (`~/.config/skync/manifest.yaml`), with the upstream remote and `src -> dest` paths. Project entries shadow global entries with the same name.
 
 ### `check [name]`
 
@@ -124,7 +138,7 @@ This is the only command that uses exit code `3`; everything else uses `1` for o
 skync status [name] [--global]
 ```
 
-Read-only summary of local-vs-base modifications and pending-conflict state, per skill. Output shows added / modified / deleted counts and an indented per-file list.
+Read-only summary of local-vs-base modifications and pending-conflict state, per skill. Output shows added / modified / deleted counts and an indented per-file list. Does not fetch upstream; no network required.
 
 `status` always exits `0` on a successful run. Genuine operational errors still surface through the global error handler with exit `1`.
 
@@ -152,13 +166,15 @@ Three-way merge upstream changes into each tracked skill's destination.
 Behavior:
 
 1. Snapshot the live copy under `<state-dir>/backups/<skill>/<ts>/` before changing anything.
-2. Three-way merge `base` → `upstream` into `dest`. Non-overlapping upstream changes apply silently.
+2. Three-way merge `base` to `upstream` into `dest`. Non-overlapping upstream changes apply silently.
 3. On clean merge, advance `base` to the upstream tree and update `state.json`.
-4. On overlap, write git-style conflict markers into the affected files, set `pendingSha` on the skill, and leave `base` untouched. The snapshot taken in step 1 is preserved across retention pruning so you can always roll back the failed update.
+4. On overlap, write git-style conflict markers into the affected files, set `pendingSha` and `pendingSnapshotTs` on the skill, and leave `base` untouched. The snapshot taken in step 1 is preserved across retention pruning so you can always roll back the failed update.
 
 If the live copy still contains unresolved conflict markers from an earlier run, `update` refuses to start.
 
 Exit codes: `0` clean, `1` operational error, `2` completed with at least one conflict awaiting resolution.
+
+Writes on clean merge: `dest/`, `.skync/base/<name>/`, `.skync/state.json`, `.skync/backups/<name>/<ts>/`. On conflict: `dest/` (markers written in place), `.skync/state.json` (pendingSha set), `.skync/backups/<name>/<ts>/`.
 
 ### `resolve <name>`
 
@@ -170,6 +186,8 @@ Mark a conflicted skill resolved. Verifies no `<<<<<<<` / `=======` / `>>>>>>>` 
 
 Non-text conflicts (binary changes, delete-vs-modify, type changes) leave no markers in the destination. `resolve` accepts the current dest as the chosen side for these cases.
 
+Writes: `.skync/base/<name>/`, `.skync/state.json`, `.skync/backups/<name>/<ts>/`.
+
 ### `rollback <name> [--to <ts>]`
 
 ```
@@ -180,6 +198,8 @@ skync rollback <name> --to <timestamp>
 Without `--to`, lists available snapshots newest-first. With `--to`, validates the timestamp, takes a safety snapshot of the current state, then atomically restores `dest`, `base`, and the state entry from the snapshot.
 
 Timestamps look like `2026-05-23T14-07-42-318Z` (the on-disk subdirectory name under `<state-dir>/backups/<skill>/`).
+
+Writes on restore: `dest/`, `.skync/base/<name>/`, `.skync/state.json`, `.skync/backups/<name>/<ts>/` (safety snapshot).
 
 ### `discover <name>`
 
@@ -226,7 +246,20 @@ skills:
 
 When `update` finds overlap between upstream and your local edits:
 
-1. The affected files get git-style conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`). `update` exits `2`.
+1. The affected files get git-style conflict markers. `update` exits `2`.
+
+   ```
+   <<<<<<< local
+   ## My local section
+
+   I added this locally.
+   =======
+   ## Upstream section
+
+   Upstream added this.
+   >>>>>>> upstream
+   ```
+
 2. Open each marked file, choose the right content, and remove the markers.
 3. Run `skync resolve <name>`. It verifies no markers remain, snapshots the resolved copy, advances `base` to the pending upstream commit, and clears the pending flag.
 
