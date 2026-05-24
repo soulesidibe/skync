@@ -405,6 +405,137 @@ describe("skync add (CLI)", () => {
       await rm(home, { recursive: true, force: true });
     }
   });
+
+  it("derives --dest to .claude/skills/<name> for a project add when omitted", async () => {
+    const fixture = await createDiscoverableFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-add-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const res = await runCli(
+        ["add", "demo", "--repo", fixture.url],
+        work,
+        home,
+      );
+      expect(res.code).toBe(0);
+
+      // dest received the discovered subtree contents at the convention path.
+      expect(await readFile(join(work, ".claude/skills/demo/SKILL.md"), "utf8")).toBe(
+        "---\nname: demo\n---\ndemo v1\n",
+      );
+
+      // manifest and state freeze the convention path verbatim, as if typed.
+      const manifest = await readFile(join(work, "skync.yaml"), "utf8");
+      expect(manifest).toContain("dest: .claude/skills/demo");
+      const state = JSON.parse(await readFile(join(work, ".skync/state.json"), "utf8"));
+      expect(state.skills.demo.dest).toBe(".claude/skills/demo");
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("derives --dest to ~/.claude/skills/<name> when --global is set", async () => {
+    const fixture = await createDiscoverableFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-add-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const res = await runCli(
+        ["add", "demo", "--global", "--repo", fixture.url],
+        work,
+        home,
+      );
+      expect(res.code).toBe(0);
+
+      // dest expanded to the home-anchored convention path.
+      expect(await readFile(join(home, ".claude/skills/demo/SKILL.md"), "utf8")).toBe(
+        "---\nname: demo\n---\ndemo v1\n",
+      );
+
+      // manifest and state freeze the literal `~/.claude/skills/<name>` as if typed.
+      const manifest = await readFile(
+        join(home, ".config/skync/manifest.yaml"),
+        "utf8",
+      );
+      expect(manifest).toContain("dest: ~/.claude/skills/demo");
+      const state = JSON.parse(
+        await readFile(join(home, ".config/skync/.skync/state.json"), "utf8"),
+      );
+      expect(state.skills.demo.dest).toBe("~/.claude/skills/demo");
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("uses an explicit --dest verbatim and skips derivation", async () => {
+    const fixture = await createDiscoverableFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-add-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      const res = await runCli(
+        ["add", "demo", "--repo", fixture.url, "--dest", "some/other/path"],
+        work,
+        home,
+      );
+      expect(res.code).toBe(0);
+
+      // dest is the explicit path, not the convention.
+      expect(await readFile(join(work, "some/other/path/SKILL.md"), "utf8")).toBe(
+        "---\nname: demo\n---\ndemo v1\n",
+      );
+      const manifest = await readFile(join(work, "skync.yaml"), "utf8");
+      expect(manifest).toContain("dest: some/other/path");
+      expect(manifest).not.toContain(".claude/skills/demo");
+      const state = JSON.parse(await readFile(join(work, ".skync/state.json"), "utf8"));
+      expect(state.skills.demo.dest).toBe("some/other/path");
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("adopts existing files at the derived dest", async () => {
+    const fixture = await createDiscoverableFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-add-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      // Pre-create files at the derived convention path so the adopt branch fires.
+      await mkdir(join(work, ".claude/skills/demo"), { recursive: true });
+      await writeFile(join(work, ".claude/skills/demo/SKILL.md"), "mine\n");
+      await writeFile(join(work, ".claude/skills/demo/local.md"), "local only\n");
+
+      const res = await runCli(
+        ["add", "demo", "--repo", fixture.url],
+        work,
+        home,
+      );
+      expect(res.code).toBe(0);
+
+      // dest is adopted as-is: local edits and local-only files survive.
+      expect(await readFile(join(work, ".claude/skills/demo/SKILL.md"), "utf8")).toBe(
+        "mine\n",
+      );
+      expect(await readFile(join(work, ".claude/skills/demo/local.md"), "utf8")).toBe(
+        "local only\n",
+      );
+
+      // base is seeded from current upstream.
+      expect(await readFile(join(work, ".skync/base/demo/SKILL.md"), "utf8")).toBe(
+        "---\nname: demo\n---\ndemo v1\n",
+      );
+
+      // adopt path took it, signaled via stdout.
+      expect(res.stdout).toMatch(/adopted/i);
+      expect(res.stdout).toMatch(/kept existing/i);
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
 });
 
 async function commitToFixture(dir: string, files: Record<string, string>, message: string): Promise<void> {
