@@ -51,12 +51,10 @@ The typical round trip: `add` vendors the skill and seeds base from upstream. Ed
 For someone who already knows the concepts, adopting `grill-me` from Matt Pocock's skills repo:
 
 ```sh
-skync add grill-me \
-  --repo https://github.com/mattpocock/skills \
-  --dest .claude/skills/grill-me
+skync add grill-me --repo https://github.com/mattpocock/skills
 ```
 
-`--src` is omitted; discovery resolves it. Pull in upstream changes later:
+Discovery resolves `--src` and the destination defaults to the Claude Code skill convention `.claude/skills/grill-me`. Pull in upstream changes later:
 
 ```sh
 skync update grill-me
@@ -83,15 +81,16 @@ All commands accept `--help` for full usage.
 ### `add <name>`
 
 ```
-skync add <name> --repo <url> --dest <path>
-                 [--src <path>] [--remote <name>] [--ref <ref>] [--global]
+skync add <name> --repo <url>
+                 [--src <path>] [--dest <path>]
+                 [--remote <name>] [--ref <ref>] [--global]
 ```
 
 Vendor a new skill from a remote repo.
 
 - `--repo <url>` git URL of the upstream repo (required)
-- `--dest <path>` local destination for the vendored copy (required)
 - `--src <path>` path inside the repo to vendor. Optional: when omitted, skync walks the repo at the resolved ref for a single folder whose name and `SKILL.md` frontmatter `name:` both match `<name>`. If discovery finds zero matches or more than one, the command exits 1 and (for multi-match) lists every candidate so you can re-run with an explicit `--src`.
+- `--dest <path>` local destination for the vendored copy. Optional: defaults to the Claude Code skill convention `.claude/skills/<name>` (project add) or `~/.claude/skills/<name>` (with `--global`). The resolved value is written into `skync.yaml` and `state.json` exactly as if you had typed it.
 - `--remote <name>` override the auto-derived remote name in the manifest
 - `--ref <ref>` branch, tag, or commit to pin (default: remote HEAD)
 - `--global` write to the global manifest and state instead of the project's
@@ -99,6 +98,17 @@ Vendor a new skill from a remote repo.
 If `--dest` does not exist or is empty, skync vendors fresh and seeds the base tree from upstream. If `--dest` already contains files, skync adopts them as-is and seeds base from the current upstream commit, so any difference between dest and base shows up as a local modification. Upstream changes that predate the `add` are baked into base and will not re-apply on the first `update`.
 
 Writes: `skync.yaml`, `.skync/state.json`, `.skync/base/<name>/`, and `dest/` (when vendoring fresh).
+
+#### Overrides
+
+The verbose form is still accepted, useful when discovery cannot pick a single match or the destination is non-standard:
+
+```sh
+skync add grill-me \
+  --repo https://github.com/mattpocock/skills \
+  --src skills/grill-me \
+  --dest vendor/grill-me
+```
 
 ### `list`
 

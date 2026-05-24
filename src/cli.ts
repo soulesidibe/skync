@@ -136,7 +136,7 @@ async function runList(): Promise<void> {
 
   if (resolved.length === 0) {
     process.stdout.write(
-      "No tracked skills. Add one with 'skync add <name> --repo <url> --src <path> --dest <path>'.\n",
+      "No tracked skills. Add one with 'skync add <name> --repo <url>'.\n",
     );
     return;
   }
@@ -152,7 +152,7 @@ async function runList(): Promise<void> {
 interface AddOptions {
   repo: string;
   src?: string;
-  dest: string;
+  dest?: string;
   remote?: string;
   ref?: string;
   global?: boolean;
@@ -224,14 +224,22 @@ async function runAdd(name: string, options: AddOptions): Promise<void> {
   const stateDir = isGlobal ? globalStateDir(home) : projectStateDir();
   const baseDir = manifestBaseDir(manifestPath);
 
+  // When --dest is omitted, default to the Claude Code skill convention so the
+  // headline `skync add <name> --repo <url>` form works end-to-end. The literal
+  // is recorded in manifest/state exactly as if the user had typed it; POSIX
+  // separators are intentional (not path.join) so the on-disk value stays
+  // stable across platforms.
+  const destRaw =
+    options.dest ?? (isGlobal ? `~/.claude/skills/${name}` : `.claude/skills/${name}`);
+
   // A relative dest for a global skill would resolve under the config dir,
   // which is surprising. Require an explicit home-anchored or absolute path.
   if (
     isGlobal &&
-    !(options.dest === "~" || options.dest.startsWith("~/") || isAbsolute(options.dest))
+    !(destRaw === "~" || destRaw.startsWith("~/") || isAbsolute(destRaw))
   ) {
     throw new ManifestValidationError(
-      `a global skill's --dest must be absolute or start with '~/' (got '${options.dest}')`,
+      `a global skill's --dest must be absolute or start with '~/' (got '${destRaw}')`,
     );
   }
 
@@ -242,7 +250,7 @@ async function runAdd(name: string, options: AddOptions): Promise<void> {
     );
   }
 
-  const dest = expandDest(options.dest, { home, baseDir });
+  const dest = expandDest(destRaw, { home, baseDir });
   const adopt = await destOccupied(dest);
 
   const { remotes, name: remoteName, ref: remoteRef } = findOrCreateRemote(loaded.remotes, {
@@ -296,7 +304,7 @@ async function runAdd(name: string, options: AddOptions): Promise<void> {
 
   const updated = upsertSkill(
     { remotes, skills: loaded.skills },
-    { name, remote: remoteName, src: srcPath, dest: options.dest },
+    { name, remote: remoteName, src: srcPath, dest: destRaw },
   );
   await saveManifestFile(manifestPath, updated);
 
@@ -305,7 +313,7 @@ async function runAdd(name: string, options: AddOptions): Promise<void> {
   state.skills[name] = {
     remote: remoteName,
     src: srcPath,
-    dest: options.dest,
+    dest: destRaw,
     sha,
     syncedAt: new Date().toISOString(),
   };
@@ -1526,7 +1534,10 @@ function buildProgram(): Command {
     )
     .requiredOption("--repo <url>", "git repo URL to vendor from")
     .option("--src <path>", "source path within the repo (auto-discovered when omitted)")
-    .requiredOption("--dest <path>", "destination path for the vendored skill")
+    .option(
+      "--dest <path>",
+      "destination path (default: .claude/skills/<name>, or ~/.claude/skills/<name> with --global)",
+    )
     .option("--remote <name>", "override the auto-derived remote name")
     .option("--ref <ref>", "branch, tag, or commit to vendor (default: remote HEAD)")
     .option("--global", "use the global manifest and state instead of the project's")
