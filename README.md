@@ -66,7 +66,7 @@ For a step-by-step tutorial covering the full lifecycle (add, edit, update, conf
 
 | Command | Purpose | Exit codes |
 | --- | --- | --- |
-| `add <name>` | Register and vendor a new skill | 0 success, 1 error |
+| `add <name>` | Register and vendor a new skill | 0 success, 1 error, 2 adopt with conflicts |
 | `discover <name>` | Locate a skill folder in a remote repo (read-only) | 0 single match, 1 zero or multiple |
 | `list` | List tracked skills | 0 |
 | `check [name]` | Dry-run merge; scheduler-friendly | 0/1/2/3 (see below) |
@@ -95,9 +95,17 @@ Vendor a new skill from a remote repo.
 - `--ref <ref>` branch, tag, or commit to pin (default: remote HEAD)
 - `--global` write to the global manifest and state instead of the project's
 
-If `--dest` does not exist or is empty, skync vendors fresh and seeds the base tree from upstream. If `--dest` already contains files, skync adopts them as-is and seeds base from the current upstream commit, so any difference between dest and base shows up as a local modification. Upstream changes that predate the `add` are baked into base and will not re-apply on the first `update`.
+If `--dest` does not exist or is empty, skync vendors fresh and seeds the base tree from upstream. If `--dest` already contains files, skync compares it to upstream file-by-file and adopts via the same merge machinery `update` uses:
 
-Writes: `skync.yaml`, `.skync/state.json`, `.skync/base/<name>/`, and `dest/` (when vendoring fresh).
+- Identical files: no-op.
+- Text files that differ: git-style conflict markers (`<<<<<<< local` ... `=======` ... `>>>>>>> upstream`) are written in place. Exit 2; resolve with `skync resolve <name>` once you have edited the markers out, or `skync rollback <name>` to discard the adoption.
+- Binary files that differ, and symlink-vs-file mismatches: dest's bytes are kept intact and the divergence is flagged as a non-marker pending conflict. Same exit-2 + resolve/rollback flow.
+- Files only in dest: kept as-is.
+- Files only in upstream: materialized into dest.
+
+Base is always seeded from upstream HEAD, and a pre-write snapshot is taken under `.skync/backups/<name>/<ts>/` whenever the adopt mutates dest. The result is symmetric with `update`: no upstream history is silently baked in.
+
+Writes: `skync.yaml`, `.skync/state.json`, `.skync/base/<name>/`, `dest/` (when vendoring fresh or applying adopt-with-markers), and `.skync/backups/<name>/<ts>/` (adopt path).
 
 #### Overrides
 
@@ -254,7 +262,9 @@ skills:
 
 ## Conflict workflow
 
-When `update` finds overlap between upstream and your local edits:
+The same flow handles two cases: an `update` whose three-way merge overlaps, and an `add` against a non-empty `--dest` whose two-way comparison diverges. Both write the same markers, set the same pending state, and exit with the same code (`2`); resolve and rollback work the same on either.
+
+When `update` (or `add`) finds overlap between upstream and your local copy:
 
 1. The affected files get git-style conflict markers. `update` exits `2`.
 
@@ -271,7 +281,7 @@ When `update` finds overlap between upstream and your local edits:
    ```
 
 2. Open each marked file, choose the right content, and remove the markers.
-3. Run `skync resolve <name>`. It verifies no markers remain, snapshots the resolved copy, advances `base` to the pending upstream commit, and clears the pending flag.
+3. Run `skync resolve <name>`. It verifies no markers remain, snapshots the resolved copy, advances `base` to the pending upstream commit (a no-op for adopt-with-markers, since base already equals upstream), and clears the pending flag.
 
 For non-text conflicts (binary changes, delete-vs-modify, type changes), no markers are written. The local copy is left as-is and `resolve` records that as the chosen side.
 

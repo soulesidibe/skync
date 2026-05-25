@@ -210,10 +210,13 @@ async function destOccupied(path: string): Promise<boolean> {
  * dest already holds content:
  *   - dest absent or empty: vendor fresh. The src subtree is written into dest
  *     and mirrored into the base tree (base == local == upstream).
- *   - dest non-empty: adopt it as the local copy untouched, and seed the base
- *     tree from the current upstream so the first later update is a true
- *     three-way merge. Upstream changes that predate this add are baked into
- *     base and will not re-apply on that first update (documented limitation).
+ *   - dest non-empty: adopt it via marker-based comparison. Identical files are
+ *     a no-op, text divergences get git-style markers in place, binary/type
+ *     divergences leave the dest copy intact and are flagged as non-marker
+ *     conflicts, dest-only files are kept, and upstream-only files are
+ *     materialized. Base is seeded from upstream HEAD on every path. If any
+ *     conflicts surface, state records `pendingSha` + `pendingSnapshotTs`
+ *     (cleared later by `skync resolve <name>`) and the process exits 2.
  * Both paths resolve the ref to a concrete SHA, update the manifest, and record
  * the synced SHA in state.json (written last as the commit point).
  */
@@ -286,14 +289,74 @@ async function runAdd(name: string, options: AddOptions): Promise<void> {
   }
 
   const baseDest = baseSkillDir(stateDir, name);
+  const syncedAt = new Date().toISOString();
+  let adoptConflicts: Conflict[] = [];
+  let adoptSnapshotTs: string | undefined;
+
   if (adopt) {
-    // Leave dest untouched (it is the adopted local copy). Materialize current
-    // upstream into a temp dir, then mirror it into base. The temp name is kept
-    // distinct from populateBase's own ".tmp-" temp so the two never collide.
+    // A file at dest can't host a marker-based adoption (readTree would crash
+    // on a non-directory). Reject up front with a clear, actionable error.
+    const destInfo = await stat(dest);
+    if (!destInfo.isDirectory()) {
+      throw new ManifestValidationError(
+        `dest '${dest}' for skill '${name}' is a file, not a directory; remove it or pick a different --dest.`,
+      );
+    }
+
+    // Materialize current upstream into a scratch temp dir we only read from.
+    // The name is kept distinct from populateBase's own ".tmp-" temp so the
+    // two never collide.
     const tmpUpstream = `${baseDest}.adopt-${process.pid}-${Date.now()}`;
     try {
       await materializeSrc(repoPath, sha, srcPath, tmpUpstream);
+
+      // Finish any swap interrupted by an earlier crash before reading dest.
+      await recoverPendingSwap(dest);
+      const [upstreamTree, destTree] = await Promise.all([
+        readTree(tmpUpstream),
+        readTree(dest),
+      ]);
+
+      const result = mergeTrees(new Map(), upstreamTree, destTree, { adopt: true });
+
+      // Populate base BEFORE snapshotting: takeSnapshot does a recursive copy
+      // of baseSkillDir, which would ENOENT on a never-existed base. Base
+      // materialization is itself recoverable from the remote cache if we
+      // crash between here and the snapshot.
       await populateBase(baseDest, tmpUpstream);
+
+      // Snapshot dest (pre-write) + base (just-populated upstream HEAD). The
+      // meta records a clean-adopt SkillState so a later `skync rollback`
+      // restores dest to its original bytes and lands the skill in a coherent
+      // "silently adopted at upstream HEAD" state.
+      adoptSnapshotTs = nowSnapshotTimestamp();
+      const snapshotMeta: SkillState = {
+        remote: remoteName,
+        src: srcPath,
+        dest: destRaw,
+        sha,
+        syncedAt,
+      };
+      await takeSnapshot(
+        backupSnapshotDir(stateDir, name, adoptSnapshotTs),
+        dest,
+        baseDest,
+        snapshotMeta,
+      );
+
+      // Stage the merged tree (markers + upstream-only materializations +
+      // identical no-ops + dest-only retentions) in dest's parent, then swap
+      // it into place atomically. Same pattern as `runUpdate`. A crash between
+      // this swap and the saveManifestFile/writeState below leaves dest with
+      // markers but no manifest/state entry; recovery is to delete dest and
+      // restore from the snapshot under `.skync/backups/<name>/<ts>/dest/`,
+      // then re-run `skync add`.
+      const staging = stagingPathFor(dest);
+      await rm(staging, { recursive: true, force: true });
+      await writeTree(staging, result.merged);
+      await swapDirAtomic(dest, staging);
+
+      adoptConflicts = result.conflicts;
     } finally {
       await rm(tmpUpstream, { recursive: true, force: true });
     }
@@ -310,25 +373,42 @@ async function runAdd(name: string, options: AddOptions): Promise<void> {
 
   // state.json is the commit point: write it last.
   const state = await readState(statePath(stateDir));
-  state.skills[name] = {
+  const entry: SkillState = {
     remote: remoteName,
     src: srcPath,
     dest: destRaw,
     sha,
-    syncedAt: new Date().toISOString(),
+    syncedAt,
   };
+  if (adoptConflicts.length > 0) {
+    if (adoptSnapshotTs === undefined) {
+      throw new Error(
+        `internal error: adopt conflicts for '${name}' without a snapshot timestamp`,
+      );
+    }
+    // Stamp pendingSha + pendingSnapshotTs inline (don't call markPending; it
+    // expects an existing entry). pendingSha equals sha for an adopt-conflict:
+    // base already points at the upstream commit the markers came from, so
+    // `resolve`'s base-advance step is a no-op.
+    entry.pendingSha = sha;
+    entry.pendingSnapshotTs = adoptSnapshotTs;
+  }
+  state.skills[name] = entry;
   await writeState(statePath(stateDir), state);
 
   if (adopt) {
     process.stdout.write(
       `Adopted ${pc.bold(name)} from ${remoteName} at ${sha.slice(0, 12)}\n`,
     );
-    process.stdout.write(`  kept existing ${dest} as the local copy\n`);
-    process.stdout.write(
-      pc.dim(
-        "  base seeded from current upstream; changes made upstream before now are baked into base\n",
-      ),
-    );
+    if (adoptConflicts.length === 0) {
+      process.stdout.write(`  dest reconciled with upstream cleanly\n`);
+    } else {
+      reportConflicts(
+        [{ name, status: "conflict", conflicts: adoptConflicts }],
+        "adopt",
+      );
+      process.exitCode = 2;
+    }
   } else {
     process.stdout.write(
       `Added ${pc.bold(name)} from ${remoteName} at ${sha.slice(0, 12)}\n`,
@@ -630,7 +710,7 @@ async function updateSkill(
  * (binary byte conflicts, delete-vs-modify, file/dir collisions) where the local
  * side was kept. Closes with the resolve/rollback next steps.
  */
-function reportConflicts(outcomes: UpdateOutcome[]): void {
+function reportConflicts(outcomes: UpdateOutcome[], command: "update" | "adopt" = "update"): void {
   const conflicted = outcomes.filter((o) => o.status === "conflict");
   if (conflicted.length === 0) {
     return;
@@ -652,15 +732,16 @@ function reportConflicts(outcomes: UpdateOutcome[]): void {
           process.stdout.write(`    delete/modify conflict in ${c.path} (kept the modified version)\n`);
           break;
         case "type-change":
-          process.stdout.write(`    path collision in ${c.path} (left unmerged)\n`);
+          process.stdout.write(`    type mismatch at ${c.path} (file vs directory or symlink; kept your local copy)\n`);
           break;
       }
     }
   }
+  const action = command === "adopt" ? "the adoption" : "the update";
   process.stdout.write(
     pc.dim(
       "\nEdit the markers out then run 'skync resolve <name>', " +
-        "or 'skync rollback <name>' to discard the update.\n",
+        `or 'skync rollback <name>' to discard ${action}.\n`,
     ),
   );
 }
@@ -953,13 +1034,6 @@ async function checkSkill(
   // distinct lines in the per-skill report.
   const live = await readTree(dest);
   const marked = treeConflictMarkerPaths(live);
-  if (marked.length > 0) {
-    return {
-      name: skill.name,
-      status: "pending-conflict",
-      conflictPaths: marked,
-    };
-  }
 
   const state = await readState(statePath(stateDir));
   const prev = state.skills[skill.name];
@@ -967,6 +1041,18 @@ async function checkSkill(
     throw new CheckOperationalError(
       `skill '${skill.name}' is in the manifest but has no state entry. Run 'skync add' to initialize it.`,
     );
+  }
+
+  // Pending-conflict is the union of in-place markers and a state.pendingSha
+  // flag. The flag covers binary / delete-modify / type-change cases (including
+  // adopt-with-markers where state.sha == pendingSha) that leave nothing
+  // visible in dest and would otherwise slip past as "up-to-date".
+  if (marked.length > 0 || prev.pendingSha !== undefined) {
+    return {
+      name: skill.name,
+      status: "pending-conflict",
+      conflictPaths: marked,
+    };
   }
 
   const repoPath = await ensureRemoteClone(cacheDir(stateDir), remote.repo);
