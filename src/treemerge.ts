@@ -22,6 +22,16 @@ export interface MergeResult {
   clean: boolean;
 }
 
+export interface MergeOptions {
+  /**
+   * Two-way "adopt" comparison used by `skync add` against a non-empty dest.
+   * Always called with an empty base. Reclassifies the no-base conflict labels
+   * into the spec's vocabulary (content / binary / type-change) instead of the
+   * generic "add-add" used by three-way merges.
+   */
+  adopt?: boolean;
+}
+
 function sameContent(a: TreeEntry | undefined, b: TreeEntry | undefined): boolean {
   if (a === undefined || b === undefined) {
     return a === b;
@@ -93,9 +103,10 @@ function mergeText(
   };
 }
 
-export function mergeTrees(base: Tree, upstream: Tree, local: Tree): MergeResult {
+export function mergeTrees(base: Tree, upstream: Tree, local: Tree, opts: MergeOptions = {}): MergeResult {
   const merged: Tree = new Map();
   const conflicts: Conflict[] = [];
+  const adopt = opts.adopt === true;
 
   const paths = new Set<string>([...base.keys(), ...upstream.keys(), ...local.keys()]);
 
@@ -145,14 +156,21 @@ export function mergeTrees(base: Tree, upstream: Tree, local: Tree): MergeResult
       const { contents, conflicted } = mergeText(b, u, l);
       merged.set(path, { contents, mode: l.mode, type: "file" });
       if (conflicted) {
-        conflicts.push({ path, kind: b === undefined ? "add-add" : "content" });
+        const kind: ConflictKind = adopt ? "content" : b === undefined ? "add-add" : "content";
+        conflicts.push({ path, kind });
       }
       continue;
     }
 
     // Binary or type-mismatched both-sides change: cannot line-merge or mark.
     // Keep the local bytes intact (no corruption) and report the conflict.
-    conflicts.push({ path, kind: b === undefined ? "add-add" : "binary" });
+    let kind: ConflictKind;
+    if (adopt) {
+      kind = u.type !== l.type ? "type-change" : "binary";
+    } else {
+      kind = b === undefined ? "add-add" : "binary";
+    }
+    conflicts.push({ path, kind });
     merged.set(path, l);
   }
 

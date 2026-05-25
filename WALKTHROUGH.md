@@ -339,6 +339,32 @@ skync resolve qa-skill
 
 If you want to discard the update entirely instead of resolving, run `skync rollback qa-skill --to <pendingSnapshotTs>` to restore the pre-update state.
 
+### Adopting a pre-existing folder
+
+Same conflict machinery, different trigger. If you point `skync add` at a `--dest` that already contains files, skync compares dest to upstream file-by-file (no base, since this is the first sync) and writes the result back through the same atomic swap `update` uses.
+
+```sh
+# A pre-existing folder you have been editing locally for a while.
+mkdir -p vendor/grill-me
+echo "my notes\n" > vendor/grill-me/SKILL.md
+echo "local only\n" > vendor/grill-me/notes.md
+
+skync add grill-me \
+  --repo file:///path/to/some/skills-repo \
+  --src skills/grill-me \
+  --dest vendor/grill-me
+```
+
+What happens:
+
+- Identical files are no-ops.
+- Files only in dest stay (`notes.md` above).
+- Files only in upstream materialize into dest.
+- Text files that differ get git-style markers in place; the command exits `2`.
+- Binary and type-mismatched divergences leave dest's bytes intact and surface as non-marker pending conflicts in the report; same exit `2`.
+
+A pre-write snapshot is taken under `.skync/backups/grill-me/<ts>/` whenever the adopt mutates dest, so `skync rollback grill-me --to <ts>` reverts to the original folder. On a conflict adopt, `state.json` records `pendingSha = sha` and `pendingSnapshotTs = <ts>`; resolve the markers, then run `skync resolve grill-me` to clear the pending state (base is already at upstream HEAD, so resolve does not need to advance it).
+
 ---
 
 See the [Commands](README.md#commands) reference for full per-command flags and the [Conflict workflow](README.md#conflict-workflow) section for the abbreviated version of part B.

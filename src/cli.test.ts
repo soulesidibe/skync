@@ -239,13 +239,13 @@ describe("skync add (CLI)", () => {
     }
   });
 
-  it("adopts an existing non-empty dest: leaves it untouched, seeds base from upstream", async () => {
+  it("adopt with text divergence writes markers, sets pendingSha, exits 2", async () => {
     const fixture = await createFixtureRepo();
     const work = await mkdtemp(join(tmpdir(), "skync-add-"));
     const home = await mkdtemp(join(tmpdir(), "skync-home-"));
     try {
-      // A pre-existing, locally-modified dest. Its content diverges from
-      // upstream and it carries an extra file that upstream does not have.
+      // A pre-existing dest whose SKILL.md diverges from upstream (text) and
+      // also carries an extra dest-only file. Both must surface coherently.
       await mkdir(join(work, "vendor/demo"), { recursive: true });
       await writeFile(join(work, "vendor/demo/SKILL.md"), "mine\n");
       await writeFile(join(work, "vendor/demo/local.md"), "local only\n");
@@ -255,28 +255,213 @@ describe("skync add (CLI)", () => {
         work,
         home,
       );
-      expect(res.code).toBe(0);
+      expect(res.code).toBe(2);
 
-      // dest is adopted as-is: local edits and local-only files survive.
-      expect(await readFile(join(work, "vendor/demo/SKILL.md"), "utf8")).toBe("mine\n");
+      // Text divergence emits in-place git-style markers.
+      const merged = await readFile(join(work, "vendor/demo/SKILL.md"), "utf8");
+      expect(merged).toContain("<<<<<<<");
+      expect(merged).toContain("=======");
+      expect(merged).toContain(">>>>>>>");
+      expect(merged).toContain("mine");
+      expect(merged).toContain("demo v1");
+
+      // Dest-only file survives the adopt with no markers.
       expect(await readFile(join(work, "vendor/demo/local.md"), "utf8")).toBe("local only\n");
 
-      // base is seeded from current upstream, not from the adopted dest.
+      // Base seeded from upstream HEAD.
       expect(await readFile(join(work, ".skync/base/demo/SKILL.md"), "utf8")).toBe("demo v1\n");
 
-      // manifest gained the skill.
-      const manifest = await readFile(join(work, "skync.yaml"), "utf8");
-      expect(manifest).toContain("name: demo");
-      expect(manifest).toContain("src: skills/demo");
-
-      // state.json recorded the resolved upstream SHA.
+      // state.json: sha === pendingSha for an adopt-conflict; snapshot pinned.
       const state = JSON.parse(await readFile(join(work, ".skync/state.json"), "utf8"));
       expect(state.skills.demo.sha).toMatch(/^[0-9a-f]{40}$/);
+      expect(state.skills.demo.pendingSha).toBe(state.skills.demo.sha);
+      expect(state.skills.demo.pendingSnapshotTs).toMatch(
+        /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z$/,
+      );
 
-      // output communicates the adopt path and the predating-changes limitation.
+      // The pinned snapshot exists on disk under .skync/backups/<name>/<ts>.
+      const snaps = await readdir(join(work, ".skync/backups/demo"));
+      expect(snaps).toContain(state.skills.demo.pendingSnapshotTs);
+
+      // Output names the affected file and points at resolve/rollback.
       expect(res.stdout).toMatch(/adopted/i);
-      expect(res.stdout).toMatch(/kept existing/i);
-      expect(res.stdout).toMatch(/baked into base/i);
+      expect(res.stdout).toMatch(/conflict markers in SKILL\.md/);
+      expect(res.stdout).toMatch(/skync resolve/);
+      expect(res.stdout).not.toMatch(/baked into base/i);
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("adopt with no divergence is a clean no-op: exit 0, no pending state", async () => {
+    const fixture = await createFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-add-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      // Dest is non-empty and byte-identical to upstream, so no markers and
+      // no pending state.
+      await mkdir(join(work, "vendor/demo"), { recursive: true });
+      await writeFile(join(work, "vendor/demo/SKILL.md"), "demo v1\n");
+
+      const res = await runCli(
+        ["add", "demo", "--repo", fixture.url, "--src", "skills/demo", "--dest", "vendor/demo"],
+        work,
+        home,
+      );
+      expect(res.code).toBe(0);
+
+      // Dest unchanged byte-for-byte (no markers).
+      expect(await readFile(join(work, "vendor/demo/SKILL.md"), "utf8")).toBe("demo v1\n");
+
+      const state = JSON.parse(await readFile(join(work, ".skync/state.json"), "utf8"));
+      expect(state.skills.demo.sha).toMatch(/^[0-9a-f]{40}$/);
+      expect(state.skills.demo.pendingSha).toBeUndefined();
+      expect(state.skills.demo.pendingSnapshotTs).toBeUndefined();
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("adopt materializes upstream-only files into dest with no conflict", async () => {
+    const fixture = await createFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-add-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      // Dest is non-empty (so adopt fires) but is missing SKILL.md. Upstream
+      // brings it. A snapshot must still be taken (mutation occurred).
+      await mkdir(join(work, "vendor/demo"), { recursive: true });
+      await writeFile(join(work, "vendor/demo/local.md"), "local only\n");
+
+      const res = await runCli(
+        ["add", "demo", "--repo", fixture.url, "--src", "skills/demo", "--dest", "vendor/demo"],
+        work,
+        home,
+      );
+      expect(res.code).toBe(0);
+
+      // Upstream-only file landed; dest-only file untouched; no markers.
+      expect(await readFile(join(work, "vendor/demo/SKILL.md"), "utf8")).toBe("demo v1\n");
+      expect(await readFile(join(work, "vendor/demo/local.md"), "utf8")).toBe("local only\n");
+
+      const state = JSON.parse(await readFile(join(work, ".skync/state.json"), "utf8"));
+      expect(state.skills.demo.pendingSha).toBeUndefined();
+      // Snapshot taken (any mutation): backups dir exists with one entry.
+      const snaps = await readdir(join(work, ".skync/backups/demo"));
+      expect(snaps.length).toBeGreaterThanOrEqual(1);
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("adopt with binary divergence keeps dest bytes, flags non-marker pending conflict, exits 2", async () => {
+    // Upstream carries a binary file; dest carries a different binary file at
+    // the same path. No marker is possible: dest bytes must survive untouched
+    // and the conflict surfaces via pendingSha + a non-marker line in the
+    // adopt report.
+    const fixture = await createFixtureRepo();
+    await writeFile(join(fixture.dir, "skills/demo/icon.bin"), Buffer.from([0x00, 0x01, 0xff]));
+    await run("git", ["add", "-A"], { cwd: fixture.dir, env: GIT_ENV });
+    await run("git", ["commit", "-q", "-m", "add binary"], { cwd: fixture.dir, env: GIT_ENV });
+
+    const work = await mkdtemp(join(tmpdir(), "skync-add-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      await mkdir(join(work, "vendor/demo"), { recursive: true });
+      // Match SKILL.md to upstream so the only conflict is the binary.
+      await writeFile(join(work, "vendor/demo/SKILL.md"), "demo v1\n");
+      await writeFile(
+        join(work, "vendor/demo/icon.bin"),
+        Buffer.from([0x00, 0x01, 0xaa]),
+      );
+
+      const res = await runCli(
+        ["add", "demo", "--repo", fixture.url, "--src", "skills/demo", "--dest", "vendor/demo"],
+        work,
+        home,
+      );
+      expect(res.code).toBe(2);
+
+      // Dest binary bytes are intact: no corruption from a write attempt.
+      const dest = await readFile(join(work, "vendor/demo/icon.bin"));
+      expect([...dest]).toEqual([0x00, 0x01, 0xaa]);
+      // No markers anywhere in dest.
+      expect(await readFile(join(work, "vendor/demo/SKILL.md"), "utf8")).not.toContain("<<<<<<<");
+
+      const state = JSON.parse(await readFile(join(work, ".skync/state.json"), "utf8"));
+      expect(state.skills.demo.pendingSha).toBe(state.skills.demo.sha);
+      expect(res.stdout).toMatch(/binary conflict in icon\.bin/);
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("skync resolve clears the pending state for a marker-adopted skill", async () => {
+    const fixture = await createFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-add-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      await mkdir(join(work, "vendor/demo"), { recursive: true });
+      await writeFile(join(work, "vendor/demo/SKILL.md"), "mine\n");
+
+      const adopt = await runCli(
+        ["add", "demo", "--repo", fixture.url, "--src", "skills/demo", "--dest", "vendor/demo"],
+        work,
+        home,
+      );
+      expect(adopt.code).toBe(2);
+
+      // Edit the markers out: pick the upstream side as the resolution.
+      await writeFile(join(work, "vendor/demo/SKILL.md"), "demo v1\n");
+
+      const resolved = await runCli(["resolve", "demo"], work, home);
+      expect(resolved.code).toBe(0);
+
+      const state = JSON.parse(await readFile(join(work, ".skync/state.json"), "utf8"));
+      expect(state.skills.demo.pendingSha).toBeUndefined();
+      expect(state.skills.demo.pendingSnapshotTs).toBeUndefined();
+      expect(state.skills.demo.sha).toMatch(/^[0-9a-f]{40}$/);
+    } finally {
+      await rm(fixture.dir, { recursive: true, force: true });
+      await rm(work, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  it("skync rollback after a marker-adopt restores dest bytes to pre-adopt", async () => {
+    const fixture = await createFixtureRepo();
+    const work = await mkdtemp(join(tmpdir(), "skync-add-"));
+    const home = await mkdtemp(join(tmpdir(), "skync-home-"));
+    try {
+      await mkdir(join(work, "vendor/demo"), { recursive: true });
+      await writeFile(join(work, "vendor/demo/SKILL.md"), "mine\n");
+      await writeFile(join(work, "vendor/demo/local.md"), "local only\n");
+
+      const adopt = await runCli(
+        ["add", "demo", "--repo", fixture.url, "--src", "skills/demo", "--dest", "vendor/demo"],
+        work,
+        home,
+      );
+      expect(adopt.code).toBe(2);
+
+      const state = JSON.parse(await readFile(join(work, ".skync/state.json"), "utf8"));
+      const ts = state.skills.demo.pendingSnapshotTs as string;
+      expect(ts).toBeTruthy();
+
+      const rb = await runCli(["rollback", "demo", "--to", ts], work, home);
+      expect(rb.code).toBe(0);
+
+      // Dest is back to the pre-adopt bytes: original SKILL.md, original
+      // local.md, no markers.
+      expect(await readFile(join(work, "vendor/demo/SKILL.md"), "utf8")).toBe("mine\n");
+      expect(await readFile(join(work, "vendor/demo/local.md"), "utf8")).toBe("local only\n");
     } finally {
       await rm(fixture.dir, { recursive: true, force: true });
       await rm(work, { recursive: true, force: true });
@@ -497,7 +682,7 @@ describe("skync add (CLI)", () => {
     }
   });
 
-  it("adopts existing files at the derived dest", async () => {
+  it("adopts existing files at the derived dest via marker-based comparison", async () => {
     const fixture = await createDiscoverableFixtureRepo();
     const work = await mkdtemp(join(tmpdir(), "skync-add-"));
     const home = await mkdtemp(join(tmpdir(), "skync-home-"));
@@ -512,24 +697,24 @@ describe("skync add (CLI)", () => {
         work,
         home,
       );
-      expect(res.code).toBe(0);
+      // Text divergence in SKILL.md → markers written, exit 2.
+      expect(res.code).toBe(2);
 
-      // dest is adopted as-is: local edits and local-only files survive.
-      expect(await readFile(join(work, ".claude/skills/demo/SKILL.md"), "utf8")).toBe(
-        "mine\n",
-      );
+      const merged = await readFile(join(work, ".claude/skills/demo/SKILL.md"), "utf8");
+      expect(merged).toContain("<<<<<<<");
+      expect(merged).toContain("mine");
+      expect(merged).toContain("name: demo");
+      // Dest-only file survives.
       expect(await readFile(join(work, ".claude/skills/demo/local.md"), "utf8")).toBe(
         "local only\n",
       );
-
-      // base is seeded from current upstream.
+      // Base seeded from upstream HEAD.
       expect(await readFile(join(work, ".skync/base/demo/SKILL.md"), "utf8")).toBe(
         "---\nname: demo\n---\ndemo v1\n",
       );
 
-      // adopt path took it, signaled via stdout.
       expect(res.stdout).toMatch(/adopted/i);
-      expect(res.stdout).toMatch(/kept existing/i);
+      expect(res.stdout).toMatch(/conflict markers in SKILL\.md/);
     } finally {
       await rm(fixture.dir, { recursive: true, force: true });
       await rm(work, { recursive: true, force: true });

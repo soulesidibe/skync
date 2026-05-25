@@ -215,3 +215,122 @@ describe("treemerge", () => {
     expect(result.merged.has("foo/bar.txt")).toBe(false);
   });
 });
+
+describe("treemerge adopt mode", () => {
+  // Adopt comparisons always pass an empty base: there is no prior sync to
+  // anchor a three-way merge against. The flag suppresses add-add labelling
+  // and reports the precise kind (content / binary / type-change) instead.
+  const noBase: Tree = new Map();
+
+  it("treats identical files between upstream and dest as a clean no-op", () => {
+    const upstream = tree({ "a.txt": file("same\n") });
+    const dest = tree({ "a.txt": file("same\n") });
+
+    const result = mergeTrees(noBase, upstream, dest, { adopt: true });
+
+    expect(result.clean).toBe(true);
+    expect(result.conflicts).toEqual([]);
+    expect(result.merged.get("a.txt")?.contents.toString()).toBe("same\n");
+  });
+
+  it("emits markers for divergent text files and labels the conflict 'content'", () => {
+    const upstream = tree({ "f.txt": file("from upstream\n") });
+    const dest = tree({ "f.txt": file("from local\n") });
+
+    const result = mergeTrees(noBase, upstream, dest, { adopt: true });
+
+    expect(result.clean).toBe(false);
+    expect(result.conflicts).toEqual([{ path: "f.txt", kind: "content" }]);
+
+    const merged = result.merged.get("f.txt")?.contents.toString() ?? "";
+    expect(containsConflictMarkers(Buffer.from(merged))).toBe(true);
+    expect(merged).toContain("from local");
+    expect(merged).toContain("from upstream");
+    expect(merged.indexOf("from local")).toBeLessThan(merged.indexOf("from upstream"));
+  });
+
+  it("flags binary divergence as a 'binary' conflict and keeps dest bytes intact", () => {
+    const upstream = tree({ "img.bin": binary([0x00, 0x01, 0xff]) });
+    const dest = tree({ "img.bin": binary([0x00, 0x01, 0xaa]) });
+
+    const result = mergeTrees(noBase, upstream, dest, { adopt: true });
+
+    expect(result.clean).toBe(false);
+    expect(result.conflicts).toEqual([{ path: "img.bin", kind: "binary" }]);
+    expect(result.merged.get("img.bin")?.contents).toEqual(Buffer.from([0x00, 0x01, 0xaa]));
+  });
+
+  it("flags a symlink-vs-file mismatch as a 'type-change' conflict and keeps dest", () => {
+    const upstream: Tree = new Map([
+      ["link", { contents: Buffer.from("target/path"), mode: 0o777, type: "symlink" }],
+    ]);
+    const dest: Tree = new Map([["link", { contents: Buffer.from("hello\n"), mode: 0o644, type: "file" }]]);
+
+    const result = mergeTrees(noBase, upstream, dest, { adopt: true });
+
+    expect(result.clean).toBe(false);
+    expect(result.conflicts).toEqual([{ path: "link", kind: "type-change" }]);
+    expect(result.merged.get("link")?.contents.toString()).toBe("hello\n");
+    expect(result.merged.get("link")?.type).toBe("file");
+  });
+
+  it("materializes upstream-only files into the merged tree with no conflict", () => {
+    const upstream = tree({ "fresh.txt": file("only upstream\n") });
+    const dest: Tree = new Map();
+
+    const result = mergeTrees(noBase, upstream, dest, { adopt: true });
+
+    expect(result.clean).toBe(true);
+    expect(result.conflicts).toEqual([]);
+    expect(result.merged.get("fresh.txt")?.contents.toString()).toBe("only upstream\n");
+  });
+
+  it("keeps dest-only files in the merged tree with no conflict", () => {
+    const upstream: Tree = new Map();
+    const dest = tree({ "mine.txt": file("only local\n") });
+
+    const result = mergeTrees(noBase, upstream, dest, { adopt: true });
+
+    expect(result.clean).toBe(true);
+    expect(result.conflicts).toEqual([]);
+    expect(result.merged.get("mine.txt")?.contents.toString()).toBe("only local\n");
+  });
+
+  it("preserves dest's mode when emitting marker entries", () => {
+    const upstream = tree({ "run.sh": file("upstream\n", 0o755) });
+    const dest = tree({ "run.sh": file("local\n", 0o644) });
+
+    const result = mergeTrees(noBase, upstream, dest, { adopt: true });
+
+    expect(result.clean).toBe(false);
+    expect(result.merged.get("run.sh")?.mode).toBe(0o644);
+  });
+
+  it("reports a single mixed adopt: identical no-op, upstream-only added, text conflict, binary conflict, dest-only kept", () => {
+    const upstream = tree({
+      "same.txt": file("same\n"),
+      "fresh.txt": file("u\n"),
+      "diff.txt": file("upstream\n"),
+      "img.bin": binary([0x00, 0xff]),
+    });
+    const dest = tree({
+      "same.txt": file("same\n"),
+      "diff.txt": file("local\n"),
+      "img.bin": binary([0x00, 0xaa]),
+      "mine.txt": file("local only\n"),
+    });
+
+    const result = mergeTrees(noBase, upstream, dest, { adopt: true });
+
+    expect(result.clean).toBe(false);
+    const kinds = new Map(result.conflicts.map((c) => [c.path, c.kind]));
+    expect(kinds.get("diff.txt")).toBe("content");
+    expect(kinds.get("img.bin")).toBe("binary");
+    expect(kinds.size).toBe(2);
+    // Clean paths land in merged: identical no-op, upstream-only materialized,
+    // dest-only retained.
+    expect(result.merged.get("same.txt")?.contents.toString()).toBe("same\n");
+    expect(result.merged.get("fresh.txt")?.contents.toString()).toBe("u\n");
+    expect(result.merged.get("mine.txt")?.contents.toString()).toBe("local only\n");
+  });
+});
